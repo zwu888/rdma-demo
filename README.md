@@ -19,6 +19,24 @@ Ethernet) avoids both issues.
 Already installed on both hosts: `rdma-core`, `perftest`, `ibverbs-utils`,
 `infiniband-diags`, `libfabric-bin`, `mstflint`.
 
+For building/debugging the C++ program in `src/` (`libfabric-dev`,
+`build-essential`, `gdb`, `valgrind`, `clang-format`, `clangd`, `bear`):
+
+```bash
+sudo apt-get install -y libfabric-dev pkg-config build-essential \
+    gdb valgrind clang-format clangd bear
+```
+
+```bash
+cd src
+make              # optimized build: fi_bw
+make fi_bw-debug  # -O0 -g -fsanitize=address,undefined, for gdb/debugging
+bear -- make      # regenerates compile_commands.json for clangd/editor IntelliSense
+```
+
+`.clang-format` at the repo root defines the style (Google-based, 4-space
+indent, 90-col limit) — run `clang-format -i src/fi_bw.cpp` to apply it.
+
 ## Setup steps (from scratch)
 
 1. **Install tools** on both hosts:

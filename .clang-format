@@ -1,0 +1,6 @@
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 90
+PointerAlignment: Right
+AllowShortIfStatementsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Empty
