@@ -19,6 +19,53 @@ Ethernet) avoids both issues.
 Already installed on both hosts: `rdma-core`, `perftest`, `ibverbs-utils`,
 `infiniband-diags`, `libfabric-bin`, `mstflint`.
 
+## Setup steps (from scratch)
+
+1. **Install tools** on both hosts:
+   ```bash
+   sudo apt-get install -y rdma-core infiniband-diags perftest \
+       ibverbs-utils libfabric-bin mstflint
+   ```
+
+2. **Check current link type** of the ConnectX-4 (native IB by default on
+   these cards):
+   ```bash
+   sudo mstconfig -d <pci-bdf> query | grep LINK_TYPE
+   # LINK_TYPE_P1  IB(1)
+   ```
+
+3. **Switch to Ethernet mode** on both cards. Native IB requires the cable
+   to be certified for IB link training and a Subnet Manager to bring the
+   port to ACTIVE — neither was available on this point-to-point link, so
+   the port sat at `phys_state: Disabled`. RoCE avoids both:
+   ```bash
+   sudo mstconfig -d <pci-bdf> set LINK_TYPE_P1=ETH
+   ```
+
+4. **Apply without a full reboot** using a firmware/PCI reset:
+   ```bash
+   sudo mstfwreset -d <pci-bdf> reset
+   ```
+   The RDMA device is renamed by udev after this (e.g. `mlx5_0` ->
+   `rocep21s0`) since it's now Ethernet/RoCE instead of native IB.
+
+5. **Verify link is up**:
+   ```bash
+   ibv_devinfo -d <rocep...>   # state should be PORT_ACTIVE / phys LinkUp
+   ip -br link show            # interface should show LOWER_UP
+   ```
+
+6. **Assign IPs** for a direct point-to-point link (no switch):
+   ```bash
+   # host A
+   sudo ip addr add 192.168.100.1/24 dev <iface>
+   # host B
+   sudo ip addr add 192.168.100.2/24 dev <iface>
+   ping 192.168.100.2   # sanity check from host A
+   ```
+
+7. Run the demo scripts below.
+
 ## Usage
 
 Run the server side first on one host, then the client side on the other,
