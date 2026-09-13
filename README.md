@@ -162,3 +162,33 @@ hardware. The difference here was entirely in **link establishment**
 new transport; it's a portable API sitting on top of the same verbs
 device, so its numbers reflect the underlying RoCE link plus libfabric's
 own protocol/framing overhead rather than a competing fabric.
+
+### Why the latency numbers differ so much (0.94us vs 12.3us)
+
+The `ib_write_lat`/`fi_pingpong` latency figures above aren't actually an
+apples-to-apples comparison — two effects stack up:
+
+1. **Message size dominates.** `ib_write_lat` used a 2-byte payload;
+   `fi_pingpong` (as invoked by `run_libfabric.sh`) defaults to 64KB. At
+   ~100Gb/s, just serializing 64KB one-way takes ~5.24us
+   (64*1024*8 bits / 100e9 bits/s); round-trip that's ~10.5us of pure wire
+   time — nearly the entire measured 12.3us. Re-running `fi_pingpong` at a
+   matched 2-byte size gives ~2.30us, much closer to the RDMA write number.
+
+2. **Operation type accounts for the rest.** `ib_write_lat` issues an
+   **RDMA Write with inline data** — the payload rides inside the work
+   request (no separate memory fetch), it's **one-sided** (the remote
+   CPU/software is never involved; the NIC places data directly into
+   remote memory), measured in a tight polling loop with TX depth 1 and
+   nothing else happening. `fi_pingpong` uses **Send/Recv (two-sided)** —
+   the receiver must have a receive buffer already posted and generates
+   its own completion, and the benchmark does an explicit
+   send-then-wait-for-ack round trip on top of libfabric's own progress
+   engine. Same NIC, same RC QP under the hood, but inherently more
+   round-trip machinery for a two-sided op than a one-sided inline write.
+
+| Test | Size | Latency |
+|---|---|---|
+| `ib_write_lat` | 2B | 0.94 us |
+| `fi_pingpong` | 2B | 2.30 us |
+| `fi_pingpong` | 64KB | 12.3 us |
