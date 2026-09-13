@@ -14,6 +14,11 @@ the cable wasn't recognized for native IB link training and there's no
 Subnet Manager on this point-to-point link. RoCE (RDMA over Converged
 Ethernet) avoids both issues.
 
+Writing your own custom perf test program against one of these APIs?
+See [TUTORIAL.md](TUTORIAL.md) for the common architecture pattern
+behind `fi_bw`/`dpdk_perf`/`ibv_bw` and the specific bugs/gotchas hit
+building each one.
+
 ## Prerequisites
 
 Already installed on both hosts: `rdma-core`, `perftest`, `ibverbs-utils`,
