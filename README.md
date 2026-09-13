@@ -127,6 +127,54 @@ native libfabric address over a small out-of-band plain-TCP control
 channel before connecting, the same pattern used internally by
 `fabtests`' example programs.
 
+### Architecture
+
+```mermaid
+sequenceDiagram
+    participant S as Server (hpz6g4)
+    participant C as Client (hpz8g4)
+
+    Note over S,C: 1. Connection setup
+    S->>S: fi_getinfo (FI_SOURCE, ep_type unconstrained --<br/>verbs provider quirk workaround)
+    S->>S: fi_passive_ep + fi_listen
+    S->>S: fi_getname(pep) -> native address
+    S->>S: open plain-TCP control socket (port+1)
+    C->>S: connect to control socket
+    S-->>C: send native address (out-of-band, not RDMA)
+    C->>C: fi_getinfo (no node/service needed)
+    C->>C: fi_endpoint + fi_enable
+    C->>S: fi_connect(native address) [FI_CONNREQ over verbs/RDMA_CM]
+    S->>S: fi_eq_sread -> FI_CONNREQ
+    S->>S: fi_endpoint(conn_info) + fi_accept
+    S-->>C: FI_CONNECTED (via EQ, both sides)
+
+    Note over S,C: 2. Pipelined data path (window = N outstanding)
+    S->>S: pre-post N fi_recv() into registered buffer slots
+    C->>C: pre-post N fi_send() into registered buffer slots
+    loop until iters completed
+        C->>S: RDMA send (verbs RC QP)
+        S-->>C: (transport-level ack, RC QP)
+        S->>S: fi_cq_read(rxcq) completion -> repost fi_recv on that slot
+        C->>C: fi_cq_read(txcq) completion -> repost fi_send on that slot
+    end
+    C->>C: measure elapsed time -> Gb/s, MB/s, usec/xfer
+```
+
+Key structural points:
+- **Two CQs per endpoint** (`txcq`/`rxcq`), each sized `window + 8`, so up
+  to `window` operations can be in flight without stalling on completion
+  processing.
+- **One registered memory region per side** (`fi_mr_reg`), sized
+  `size * window`, sliced into `window` fixed buffer slots reused across
+  iterations — no per-message allocation or registration.
+- **`fi_context` array doubles as the completion-to-slot map**: each
+  outstanding operation's context pointer is `&ctx[i]`; on completion,
+  `(fi_context*)cqe.op_context - ctx.data()` recovers which buffer slot to
+  repost, so there's no separate lookup table.
+- **The control channel is plain BSD sockets**, entirely separate from
+  the RDMA path — it exists only to move ~dozens of bytes (the server's
+  native address) once, before any RDMA traffic starts.
+
 Build and run:
 
 ```bash
