@@ -113,6 +113,51 @@ Notes:
   `RLIMIT_MEMLOCK`/`/etc/security/limits.conf` on both hosts if you want
   `-S all` to run without hitting `ENOMEM`.
 
+## libfabric pipelined bandwidth demo (`fi_bw`)
+
+`fi_pingpong`'s lower bandwidth numbers (see below) are mostly an artifact
+of it never keeping more than one message outstanding. `src/fi_bw.cpp` is
+a small custom C++ program that keeps several sends/recvs outstanding at
+once — like `ib_write_bw`'s `TX depth` — to get a real saturation
+bandwidth number out of libfabric instead. It also works around a real
+provider quirk (see the comment at the top of the file): the verbs
+provider's server-side (source/listen) address resolution reliably fails
+for a plain IP on this setup, so client and server exchange the server's
+native libfabric address over a small out-of-band plain-TCP control
+channel before connecting, the same pattern used internally by
+`fabtests`' example programs.
+
+Build and run:
+
+```bash
+cd src && make
+
+# on hpz6g4 (server)
+../scripts/run_fi_bw.sh server
+
+# on hpz8g4 (client)
+../scripts/run_fi_bw.sh client 192.168.100.2
+```
+
+Args: `size` (default 65536), `window` = max outstanding sends (default
+16), `iters` (default 20000).
+
+Results (64KB, tuned: performance governor + NUMA pin), by window depth —
+confirms pipelining, not libfabric itself, was capping `fi_pingpong`'s
+bandwidth:
+
+| Window | Bandwidth |
+|---|---|
+| 1 | 30.3 Gb/s |
+| 16 | 83.4 Gb/s |
+| 64 | 89.2 Gb/s |
+
+For comparison: `ib_write_bw` (TX depth 128) reaches ~92.5 Gb/s, and
+`fi_pingpong` (no pipelining) reaches ~42.7 Gb/s. `fi_bw` at window 64
+closes almost all of that gap using the same libfabric `verbs` provider —
+confirming the earlier explanation that lack of pipelining, not libfabric
+overhead, was the dominant factor in `fi_pingpong`'s lower bandwidth.
+
 Reference result (64KB, msg endpoint, round-trip): ~5.3 GB/s (~42.7 Gb/s),
 ~12.3 us/xfer. Lower than the one-way `ib_write_bw` throughput above
 because pingpong is a request/ack round trip rather than a streamed,
