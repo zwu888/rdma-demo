@@ -741,13 +741,26 @@ sudo ./dpdk_perf -l 0-1 -n 4 -a 0000:15:00.0 -- client \
 ```
 
 Result (tuned: performance governor + NUMA pin), 2000/2000 round trips,
-zero timeouts: **RTT avg 3.688 us, min 3.371 us**. This is pure
-DPDK-to-DPDK userspace polling on both ends — no kernel network stack
-anywhere in the path — which is why it's dramatically lower than the
-`testpmd icmpecho` + kernel-`ping` number above (0.099 ms / 99 us): that
-test only removed the kernel stack from the *responder* side, since
-`ping` on the client end still goes through the kernel. This number
-removes it from both.
+zero timeouts: **RTT avg 3.667 us, min 3.331 us, max 98.164 us, stdev
+2.174 us**. This is pure DPDK-to-DPDK userspace polling on both ends —
+no kernel network stack anywhere in the path — which is why it's
+dramatically lower than the `testpmd icmpecho` + kernel-`ping` number
+above (0.099 ms / 99 us): that test only removed the kernel stack from
+the *responder* side, since `ping` on the client end still goes through
+the kernel. This number removes it from both.
+
+**Jitter** is reported two ways, since they answer different questions:
+- **stdev (2.174 us)** — overall spread of RTTs around the mean. Pulled
+  up here mostly by a handful of outlier spikes (max 98us vs a ~3.3-3.7us
+  typical range), likely OS scheduling/interrupt noise rather than
+  anything structural.
+- **RFC 3550 mean jitter (0.310 us)** — average magnitude of change
+  between *consecutive* samples, the metric real-time/audio-video jitter
+  buffers care about (does this RTT differ much from the *previous*
+  one, not from the mean). Much lower than stdev here, meaning the
+  typical sample-to-sample variation is tiny and the stdev is being
+  driven by a few isolated outliers rather than a consistently noisy
+  signal — a distinction stdev alone wouldn't surface.
 
 #### Architecture
 

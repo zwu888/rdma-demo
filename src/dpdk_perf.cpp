@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -377,8 +378,29 @@ static void run_client_latency(const rte_ether_addr &own_mac,
         mn = std::min(mn, v);
         mx = std::max(mx, v);
     }
-    printf("RTT us: avg=%.3f min=%.3f max=%.3f (n=%zu)\n", sum / rtts_us.size(),
-           mn, mx, rtts_us.size());
+    double avg = sum / rtts_us.size();
+
+    // Jitter, two common ways to define it:
+    //  - stdev: overall spread of RTTs around the mean.
+    //  - RFC 3550 mean jitter: average magnitude of the change between
+    //    consecutive samples -- captures short-term variability (does
+    //    this RTT differ from the *previous* one) rather than spread
+    //    from the mean, which is what audio/video jitter buffers care
+    //    about. A low stdev with high mean-consecutive-jitter would mean
+    //    "consistently alternating," which stdev alone wouldn't show.
+    double var_sum = 0;
+    for (double v : rtts_us) var_sum += (v - avg) * (v - avg);
+    double stdev = std::sqrt(var_sum / rtts_us.size());
+
+    double rfc3550_sum = 0;
+    for (size_t i = 1; i < rtts_us.size(); i++)
+        rfc3550_sum += std::fabs(rtts_us[i] - rtts_us[i - 1]);
+    double rfc3550_jitter =
+        rtts_us.size() > 1 ? rfc3550_sum / (rtts_us.size() - 1) : 0.0;
+
+    printf("RTT us: avg=%.3f min=%.3f max=%.3f stdev=%.3f "
+           "jitter(rfc3550)=%.3f (n=%zu)\n",
+           avg, mn, mx, stdev, rfc3550_jitter, rtts_us.size());
 }
 
 int main(int argc, char **argv) {
