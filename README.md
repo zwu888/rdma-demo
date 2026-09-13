@@ -198,21 +198,62 @@ apples-to-apples comparison — two effects stack up:
 Every perftest/libfabric run logged `CPU Frequency is not max` — both
 hosts default to the `powersave` cpufreq governor, which lets cores clock
 down between the polling loop's completion checks. RDMA latency
-benchmarks are exactly the workload this hurts most.
+benchmarks are exactly the workload this hurts most. Fix in two steps:
 
-```bash
-sudo apt-get install -y numactl linux-cpupower
-sudo cpupower frequency-set -g performance
-```
+1. **Install the tools** (both hosts):
+   ```bash
+   sudo apt-get install -y numactl linux-cpupower
+   ```
 
-Then pin the process to the NIC's local NUMA node (`cat
-/sys/class/infiniband/<dev>/device/numa_node`; both hosts here are node 0)
-with `numactl --cpunodebind=0 --membind=0 fi_pingpong ...`.
+2. **Switch the CPU governor to `performance`**:
+   ```bash
+   sudo cpupower frequency-set -g performance
+   # verify:
+   cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u
+   # -> performance
+   ```
+   This only affects the running kernel — it resets to `powersave` on
+   reboot unless you make it persistent. To persist, add a systemd unit
+   that runs the same command at boot:
+   ```ini
+   # /etc/systemd/system/cpu-performance.service
+   [Unit]
+   Description=Set CPU governor to performance
+   After=multi-user.target
 
-| | Default (powersave, no pinning) | Tuned (performance + NUMA pin) |
-|---|---|---|
-| Latency (2B) | 2.30 us | 1.44 us (~37% lower) |
-| Bandwidth (64KB) | 5340 MB/s (~42.7 Gb/s) | 5632 MB/s (~45.1 Gb/s) (~5% higher) |
+   [Service]
+   Type=oneshot
+   ExecStart=/usr/bin/cpupower frequency-set -g performance
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now cpu-performance.service
+   ```
+
+3. **Find the NIC's local NUMA node** so the benchmark process runs on
+   CPUs physically close to the card (avoids cross-socket memory/PCIe
+   traffic):
+   ```bash
+   cat /sys/class/infiniband/<dev>/device/numa_node
+   # both hosts here: node 0
+   ```
+
+4. **Pin the process with `numactl`** when running the demo:
+   ```bash
+   numactl --cpunodebind=0 --membind=0 fi_pingpong -p verbs -d <dev> -e msg -S <size> ...
+   ```
+   (Swap in whichever node number step 3 reported if it isn't 0.)
+
+5. **Re-measure and compare** — this is what isolates whether the tuning
+   actually helped versus noise:
+
+   | | Default (powersave, no pinning) | Tuned (performance + NUMA pin) |
+   |---|---|---|
+   | Latency (2B) | 2.30 us | 1.44 us (~37% lower) |
+   | Bandwidth (64KB) | 5340 MB/s (~42.7 Gb/s) | 5632 MB/s (~45.1 Gb/s) (~5% higher) |
 
 Note: `cpupower frequency-set` is not persistent across reboots on its
 own — set it via a systemd unit or `tuned` profile if you need it to
