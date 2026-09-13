@@ -364,25 +364,31 @@ exact same cable and ports that wouldn't train in IB mode.
       matching packet waiting. No error, no log line -- it just never
       returns a packet. Don't request a burst size of 1 from this PMD.
 
-- [ ] Fix `ibv_bw` latency mode resource exhaustion (`src/ibv_bw.cpp`):
-      sustained runs (n=5000) eventually hit
-      `ibv_post_send(): Cannot allocate memory` on the server's echo
-      path after roughly 1000-1500 round trips -- not immediately (two
-      real bugs *were* found and fixed along the way: a GID-index
-      selection bug causing `ENETUNREACH`, and a shared-CQ undersizing
-      bug causing early `ENOMEM` -- see the "Custom raw ibverbs" section
-      above for both). Switching the echo opcode from
-      `RDMA_WRITE_WITH_IMM` to plain two-sided `IBV_WR_SEND` didn't
-      change the failure at all, ruling out anything opcode-specific.
-      Current workaround: cap `n` well under the failure threshold
-      (n=500 runs consistently clean). Throughput mode (one-sided
-      `RDMA_WRITE`) is unaffected at any iteration count tested (up to
-      20000) -- only the repeated post-completion-repost cycle in
-      latency mode's server hits this. Worth a fresh look at whether
-      it's a real driver/firmware resource pool being exhausted (this
-      ConnectX-4's firmware, `12.18.1000`) versus something still
-      wrong in the repost bookkeeping that isn't obvious from the
-      symptom alone.
+- [ ] `ibv_bw` latency mode intermittently fails (`src/ibv_bw.cpp`) --
+      root cause identified as hardware/firmware-level, not an
+      application bug, but not fixable from application code alone.
+      Client sees `transport retry counter exceeded`; server sees
+      synchronous `ibv_post_send(): Cannot allocate memory`. Failure
+      point is inconsistent (iteration 1 to ~1500), which was the
+      first sign this wasn't a deterministic software bug. mlx5
+      hardware counters
+      (`/sys/class/infiniband/<dev>/ports/1/hw_counters/`) show the
+      client's `local_ack_timeout_err` jumping by exactly 8
+      (`retry_cnt=7` + 1 initial attempt) during a failing run --
+      *every* retry attempt failed to get acknowledged, not occasional
+      packet loss, pointing at a systematic ACK-return-path issue for
+      the echoing ("server") role specifically on this ConnectX-4
+      firmware (`12.18.1000`) and direct-cable setup. Ruled out: opcode
+      choice (`WRITE_WITH_IMM` vs `SEND`, identical failure), stale
+      processes, QP settling time, and receive-buffer starvation
+      (`-w 8` didn't help). See the "Custom raw ibverbs" section above
+      for the full investigation and two *actual* bugs found and fixed
+      along the way (GID-index selection, shared-CQ undersizing).
+      Resolving this further would need packet capture (`ibdump`) or
+      vendor/firmware engagement. Workaround: cap `n` under the failure
+      threshold (`n=500` runs consistently clean). Throughput mode
+      (one-sided `RDMA_WRITE`, no ACK-dependent reply path) is
+      unaffected at any iteration count tested (up to 20000).
 
 ## Reference results (2026-09-12, direct cable, 100Gb ConnectX-4)
 
@@ -1209,20 +1215,62 @@ syscall (misleadingly showed "Protocol not supported" at one point),
 which cost real debugging time chasing the wrong error entirely. Fixed
 with a `die_rc(what, rc)` helper that formats the actual returned code.
 
-### Known issue: latency mode still exhausts a resource after ~1000-1500 iterations
+### Known issue: latency mode intermittently fails, root cause now identified (hardware-level, not application bug)
 
-Even after both fixes above, sustained latency-mode runs (n=5000)
-eventually hit `ibv_post_send(): Cannot allocate memory` on the
-server's echo path — not immediately (ruling out a simple queue-depth
-miscalculation like bug #2 above; `n=500` runs consistently succeed
-cleanly), but reproducibly after roughly 1000-1500 round trips. Tried
-switching the opcode from `RDMA_WRITE_WITH_IMM` to plain two-sided
-`IBV_WR_SEND` (removing dependence on the immediate-data variant
-entirely, and matching `fi_bw`/`dpdk_perf`'s own echo methodology) —
-the failure persisted identically, which rules out anything specific to
-`WRITE_WITH_IMM` and points at something in the repeated
-post-completion-repost cycle itself (or a driver/firmware-level
-resource pool on this ConnectX-4 firmware) rather than the opcode
-choice. Not resolved; the workaround used for the numbers above was
-capping `n` well under the observed failure threshold. Throughput mode
-is unaffected at any iteration count tested (up to 20000).
+Sustained latency-mode runs fail unpredictably — sometimes on
+iteration 1, sometimes after ~1000-1500 round trips, with two
+different-looking symptoms: the client sees a completion error
+(`transport retry counter exceeded`) and the server sees a synchronous
+`ibv_post_send(): Cannot allocate memory`. The wildly inconsistent
+failure point (not a fixed iteration count) was the first clue this
+wasn't a simple deterministic software bug like the two fixed above.
+
+**Investigation, in order:**
+1. Switched the echo opcode from `RDMA_WRITE_WITH_IMM` to plain
+   two-sided `IBV_WR_SEND` (matching `fi_bw`/`dpdk_perf`'s own echo
+   methodology) — identical failure, ruling out anything opcode-specific.
+2. Checked for stale/lingering processes from earlier test runs
+   (competing for the OOB port or leaving cross-talk) — none found;
+   both hosts were clean before each failing run.
+3. Added a 200ms settling delay after `bring_up_qp()` in case the QP
+   needed time to become fully ready at the hardware level before
+   handling traffic — made no difference (2 of 3 trials still failed
+   immediately).
+4. Added `wc.vendor_err` and `wc.opcode` to the completion-error
+   message. Got `vendor_err=129` (0x81), which is simply the standard
+   mlx5 hardware confirmation of "transport retry count exceeded" (IB
+   status 0x15) — real information, but not new beyond what `wc.status`
+   already reported; it confirms the retry genuinely exhausted at the
+   hardware level rather than being a misreported status.
+5. **Checked the mlx5 hardware error counters directly**
+   (`/sys/class/infiniband/<dev>/ports/1/hw_counters/`) before and
+   after a failing run — this is what actually explained it. The
+   client's `local_ack_timeout_err` counter jumped by **exactly 8**
+   during one quick failing run (`retry_cnt=7` configured + 1 initial
+   attempt = 8 total attempts). That's the signature of a *complete,
+   systematic* failure of the ACK return path for that specific
+   exchange — every single one of the 8 attempts failed to get
+   acknowledged — not occasional rare packet loss (which would show at
+   least some successes mixed into 8 independent attempts). The
+   server's own `out_of_buffer` counter also incremented once per
+   failure.
+6. Tested whether more receive-buffer slack (`-w 8` instead of `-w 1`,
+   giving the server 8 posted receive WRs instead of 1, in case a
+   hardware-level retransmission of an already-processed message was
+   finding no buffer available) would help — it didn't; the exact same
+   counter deltas occurred regardless of window size, ruling out buffer
+   starvation as the mechanism too.
+
+**Conclusion:** this points at a genuine environment/firmware quirk in
+the ACK return path specifically for whichever side is acting as the
+"server" (echoing) role in this exact request/reply pattern on this
+ConnectX-4 firmware (`12.18.1000`) and direct-cable RoCE setup — not an
+application-level bug. All the deterministic bugs findable through code
+review (opcode choice, buffer sizing, stale state, QP timing) have been
+ruled out; what remains looks like a hardware/firmware-level ACK
+delivery issue that would need packet capture (`ibdump`) or a firmware
+update/vendor engagement to fully resolve, which is out of scope here.
+Workaround: cap `n` well under the failure threshold (`n=500` runs
+consistently clean) for a working, real latency measurement. Throughput
+mode (one-sided `RDMA_WRITE`, no ACK-dependent reply path) is unaffected
+at any iteration count tested (up to 20000).

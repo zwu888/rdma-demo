@@ -10,11 +10,11 @@
 // methodology) -- the server does nothing but hold the QP open; the
 // client's own send-completion is what's measured, same as perftest.
 //
-// Latency mode: RDMA_WRITE_WITH_IMM ping-pong. WRITE_WITH_IMM is the one
-// RDMA write variant that consumes a posted receive WR and generates a
-// receive completion, so it's how a one-sided write can still notify the
-// passive side -- the server echoes back on receiving one, the same way
-// fi_bw/dpdk_perf's server echoes on receiving a two-sided message.
+// Latency mode: two-sided Send/Recv ping-pong (an earlier version used
+// RDMA_WRITE_WITH_IMM; see the "Known issue" comment on run_server_latency
+// for why that was dropped) -- the server echoes back on receiving a
+// Send, the same way fi_bw/dpdk_perf's servers echo their own two-sided
+// messages.
 //
 // Usage:
 //   ibv_bw server|client <peer-ip> -d <device> [-s size] [-w window]
@@ -430,7 +430,9 @@ static void run_latency_client(const Config &cfg, Ctx &c, char *buf,
         if (n == 0) continue;
         if (wc.status != IBV_WC_SUCCESS)
             die_msg(std::string("completion error: ") +
-                    ibv_wc_status_str(wc.status));
+                    ibv_wc_status_str(wc.status) + " (vendor_err=" +
+                    std::to_string(wc.vendor_err) + ", opcode=" +
+                    std::to_string(wc.opcode) + ")");
         if (wc.wr_id & 0x8000000000000000ULL) {
             completed_send++;
             window_used--;
@@ -484,7 +486,9 @@ static void run_server_latency(const Config &cfg, Ctx &c, char *buf,
         if (n == 0) continue;
         if (wc.status != IBV_WC_SUCCESS)
             die_msg(std::string("completion error: ") +
-                    ibv_wc_status_str(wc.status));
+                    ibv_wc_status_str(wc.status) + " (vendor_err=" +
+                    std::to_string(wc.vendor_err) + ", opcode=" +
+                    std::to_string(wc.opcode) + ")");
         if (wc.opcode == IBV_WC_RECV) {
             size_t slot = wc.wr_id;
             total_rx++;
