@@ -268,6 +268,60 @@ exact same cable and ports that wouldn't train in IB mode.
       `fi_pingpong -p tcp` was used as a workaround for the TCP numbers
       instead.
 
+- [ ] Fix `dpdk_perf` latency mode (`src/dpdk_perf.cpp`): the server's
+      echoed reply never reaches the client. Throughput mode (one-way
+      client-to-server) works and is validated (500000/500000 frames,
+      83.5 Gb/s). Only the echo/round-trip path is broken.
+
+      **Symptom:** client's own `rte_eth_stats_get()` shows
+      `ipackets=0, imissed=0, rx_nombuf=0` after every attempt — not
+      "received," not "dropped," just never classified as arriving at
+      all — while the server reports `tx_burst()` fully succeeded for
+      every echo.
+
+      **Debugging trail** (each step ruled something out):
+      1. Original version matched a raw non-IP EtherType (0x88B5).
+         Suspected the ConnectX-4's flow steering hardware doesn't
+         reliably classify arbitrary non-IP EtherTypes in isolated mode
+         even though `rte_flow_create()` accepts the rule without
+         error. Rewrote to use real IPv4/UDP framing (dst port 5201,
+         matching the proven-working `testpmd` pattern) -- no change.
+      2. Suspected undersized (runt) frames: the original packet was
+         14+16=30 bytes, under Ethernet's 60-byte minimum. Padded to
+         60B -- no change (and the UDP version is naturally 58B+ anyway).
+      3. Suspected RX-mbuf-reuse metadata (leftover RX offload flags
+         confusing the TX path) from mutating the received mbuf in
+         place for the echo. Rewrote to allocate a fresh mbuf per
+         reply instead -- no change.
+      4. Used `testpmd` (proven reliable throughout this README) to
+         isolate further: `testpmd --forward-mode=mac` on the server
+         (the built-in equivalent of "swap MACs and retransmit") with
+         `testpmd --forward-mode=txonly` blasting traffic from the
+         client. Result: server received and retransmitted ~30.18M
+         packets; client's own counters showed `RX-dropped: ~30.18M`
+         (not `RX-packets`) -- because `txonly` mode never calls
+         `rte_eth_rx_burst()` at all, so its RX ring fills and every
+         matching arrival is dropped. This *proves the round trip
+         mechanism itself works* -- replies do physically arrive and
+         do get classified by the flow rule. It just doesn't explain
+         why my own client (which polls RX continuously, unlike
+         `txonly`) sees literal zeros instead of even a nonzero
+         `imissed` count.
+      5. Confirmed identical `link: UP, speed=100000 Mbps` and
+         `flow rule installed: ... (handle=0x40)` output on both ends;
+         ruled out a silent setup failure.
+      6. Tested with 60 iterations instead of 5 in case of a
+         cold-start/flow-cache-warmup effect -- still 100% timeouts,
+         ruling that out too.
+
+      **Net effect:** the failure is specific to my own program's
+      client-side RX path in a way that differs from `testpmd`'s, but
+      exactly how remains unidentified. Given `testpmd icmpecho`
+      already provides a working DPDK latency number (documented
+      above), this wasn't pursued further, but a fresh pair of eyes on
+      `run_client_latency()`/`setup_port()` in `src/dpdk_perf.cpp`
+      might spot something the above process didn't.
+
 ## Reference results (2026-09-12, direct cable, 100Gb ConnectX-4)
 
 - Bandwidth (64KB, RDMA Write): ~92.5 Gb/s
@@ -638,6 +692,36 @@ straight from NIC RX to a userspace ICMP reply and back out TX.
 Both tests: RoCE link state stayed `ACTIVE` throughout and after on both
 hosts, and a `fi_bw` bandwidth check immediately after each test matched
 the established baseline (~83 Gb/s) — no regression from any of this.
+
+### Custom DPDK C++ perf tool (`dpdk_perf`)
+
+`src/dpdk_perf.cpp` is a `fi_bw`-style custom program against raw
+`ethdev`/`rte_flow` instead of libfabric verbs — same safety posture
+(isolated port, one narrow explicit flow rule matching UDP dst port
+5201, nothing else ever redirected). Build with `make dpdk_perf`
+(needs `libdpdk-dev`, already installed).
+
+```bash
+# server (hpz6g4)
+sudo ./dpdk_perf -l 0-1 -n 4 -a 0000:2d:00.0 -- server \
+    ec:0d:9a:a4:cc:86 192.168.100.2 192.168.100.1 throughput
+
+# client (hpz8g4)
+sudo ./dpdk_perf -l 0-1 -n 4 -a 0000:15:00.0 -- client \
+    ec:0d:9a:78:62:72 192.168.100.1 192.168.100.2 throughput 1470 500000
+```
+
+**Throughput mode works and is validated end-to-end**: 500,000/500,000
+frames received exactly (735,000,000 bytes = 500000 x 1470B, no loss),
+**83.51 Gb/s, 7.1 Mpps** — consistent with the `testpmd`-based
+measurement above (~81.2 Gb/s). This mode only needs the proven
+unidirectional client-to-server path.
+
+**Latency mode has an open, unresolved bug** (see TODO below): the
+server-side echo-reply never arrives back at the client, even though
+extensive isolation testing proved the round trip mechanism itself
+works (see "Debugging trail" in the TODO entry). Use the `testpmd
+icmpecho` approach above for a working DPDK latency number instead.
 
 **What would actually break the RDMA flow:**
 

@@ -1,3 +1,4 @@
 src/fi_bw
 src/fi_bw-debug
+src/dpdk_perf
 src/compile_commands.json
