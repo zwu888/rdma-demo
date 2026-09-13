@@ -81,6 +81,34 @@ scripts/run.sh client bw 192.168.100.2
 
 Test types: `bw` (bandwidth), `lat` (latency), `rate` (small-message rate).
 
+## Why native IB mode didn't work
+
+Both ports initially sat at `state: DOWN` / `phys_state: Disabled` in native
+InfiniBand mode, even with the cable freshly reseated on both ends. Two
+separate requirements of native IB weren't met here:
+
+1. **Cable/module IB certification.** ConnectX-4 firmware checks the
+   transceiver/cable's SFF-8636 EEPROM for an explicit InfiniBand
+   application code before attempting IB link training. Many QSFP DACs —
+   including the one used here, which had previously worked fine in
+   Ethernet mode — only advertise Ethernet support in that EEPROM. If the
+   module doesn't self-identify as IB-capable, the firmware refuses to
+   train the link at all, and the port stays `Disabled` rather than
+   progressing through `Polling` -> `LinkUp`.
+
+2. **No Subnet Manager.** Native IB needs a Subnet Manager (SM) to assign
+   LIDs and bring a port from physical `LinkUp` to logical `ACTIVE`. This
+   is a direct cable between two hosts with no switch, and neither host
+   was running `opensm`. Even if the cable had trained successfully at the
+   physical layer, the port would have stalled at `INIT` with no SM to
+   finish bringing it up.
+
+Switching `LINK_TYPE_P1` to `ETH` sidesteps both: Ethernet link training
+doesn't gate on an IB-specific cable identifier, and Ethernet/RoCE has no
+Subnet Manager dependency — link-up is link-up. That's confirmed by the
+link coming up immediately after the `mstfwreset` in Ethernet mode, on the
+exact same cable and ports that wouldn't train in IB mode.
+
 ## Reference results (2026-09-12, direct cable, 100Gb ConnectX-4)
 
 - Bandwidth (64KB, RDMA Write): ~92.5 Gb/s
