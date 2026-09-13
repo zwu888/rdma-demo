@@ -904,6 +904,49 @@ above is exactly the deciding factor:
   need to be done and the percentile test re-run before trusting this
   path for a hard-deadline control application.
 
+#### DPDK vs RDMA for control applications
+
+Same percentile methodology, same tuned host, applied to `fi_bw`'s RDMA
+results (see "Jitter and latency distribution" above) for a direct
+comparison:
+
+| Percentile | DPDK (`dpdk_perf`, ~60B UDP) | RDMA window=1 (2B, unpipelined) | RDMA window=16 (64KB, pipelined) |
+|---|---|---|---|
+| p50 | 3.684 us | **1.601 us** | 98.753 us |
+| p90 | 3.805 us | 1.626 us | 104.321 us |
+| p99 | 4.146 us | **2.070 us** | 111.361 us |
+| p99.9 | 14.799 us | 105.045 us | 117.290 us |
+| max | 57.558 us | **2.59 ms** | 125.520 us |
+
+**Typical case: RDMA wins decisively.** Window=1 RDMA is ~2x lower
+latency than DPDK through p99 (sub-2us vs ~4us) — expected, since it's
+a one-sided RDMA write with hardware doing the placement, versus DPDK's
+userspace packet processing on both ends.
+
+**Tail: DPDK wins decisively.** DPDK's worst case (57.6us) is roughly
+**45x tighter** than RDMA window=1's worst case (2.59ms). That single
+RDMA outlier is a real red flag for anything with a hard deadline —
+likely the same class of OS-scheduling/interrupt cause as DPDK's tail,
+but hitting far harder on this particular verbs/RC-QP path in this test.
+
+**Pipelining flips the tradeoff entirely.** RDMA window=16 has the
+tightest, most bounded tail of all three (max only ~1.27x its own
+median) — but at ~99us typical latency, both too slow for a tight
+control loop and using an unrepresentative 64KB payload rather than a
+real control message size.
+
+**Net indication:** for the *lowest possible typical latency* with
+tolerance for rare misses (soft real-time), window=1 RDMA is the best
+number in this repo. For a *bounded worst case* (hard real-time),
+neither fabric is safely usable as tested — DPDK's tail is the least
+bad of the untuned options, but "least bad" isn't "proven safe." The
+real-time isolation work (`isolcpus`, IRQ affinity, `PREEMPT_RT`) is a
+prerequisite for either fabric before trusting it with a hard deadline,
+and a small-message/small-window RDMA test (matching a real control
+message size rather than a 64KB bandwidth-test payload) is still
+missing for a fair apples-to-apples comparison at that end of the
+tradeoff.
+
 #### Architecture
 
 ```mermaid
