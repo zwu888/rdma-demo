@@ -348,6 +348,36 @@ new transport; it's a portable API sitting on top of the same verbs
 device, so its numbers reflect the underlying RoCE link plus libfabric's
 own protocol/framing overhead rather than a competing fabric.
 
+### Benefits of libfabric vs raw ibverbs
+
+The comparison above shows libfabric riding on the same verbs device,
+which raises the obvious question: why use it instead of raw ibverbs at
+all?
+
+**The core benefit is portability without giving up much performance.**
+libfabric's OFI API lets the same application code run over verbs
+(IB/RoCE), AWS EFA, Omni-Path (PSM2), plain TCP, or shared memory,
+whereas raw ibverbs only ever talks to InfiniBand-family hardware. This
+repo's own numbers back that up: `fi_bw` vs `ib_write_bw` (both above)
+reached ~83-89 Gb/s vs ~92.5 Gb/s once given equivalent pipelining — the
+abstraction overhead is small. The larger gap seen earlier with
+`fi_pingpong` (~42.7 Gb/s) turned out to be about unpipelined benchmark
+methodology (see "Why libfabric's bandwidth is lower too"), not the
+libfabric abstraction itself.
+
+**The tradeoff is control and maturity of tooling.** Raw ibverbs (via
+`perftest`) gives direct QP/CQ/MR management with well-worn, battle-
+tested setup code. libfabric's abstraction occasionally surfaces
+provider-specific rough edges — this repo hit two: the `mode`/`mr_mode`
+bits the verbs provider requires (see `fi_bw`'s `make_hints()`), and the
+`ep_type`-constrained source-query bug that broke server-side address
+resolution (see the OOB control-channel workaround in `fi_bw.cpp`).
+libfabric is also the standard substrate under most MPI/NCCL stacks, so
+it's the natural choice if you need to run across more than one fabric
+type; if you're permanently single-fabric (IB/RoCE only) and want the
+most direct, lowest-abstraction path, raw verbs is simpler to reason
+about.
+
 ### TCP baseline, same tool and wire
 
 libfabric also has a plain `tcp` provider (normal kernel sockets, no
