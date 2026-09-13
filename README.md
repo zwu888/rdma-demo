@@ -103,6 +103,15 @@ Notes:
   hosts is too small for the larger sizes in fi_pingpong's default sweep,
   and `fi_mr_reg()` fails with `ENOMEM` partway through. The script pins a
   single size (default 64KB) instead.
+- **64KB isn't a requirement** — it's just the default in
+  `run_libfabric.sh`, chosen to roughly mirror the `ib_write_bw` bandwidth
+  test size above so the two tools' numbers are comparable. Any size
+  works as an explicit argument, e.g.
+  `scripts/run_libfabric.sh client 192.168.100.2 4096`; we also ran it at
+  2 bytes to get matched-size latency numbers (see below). The only real
+  ceiling is the memlock limit above — raise
+  `RLIMIT_MEMLOCK`/`/etc/security/limits.conf` on both hosts if you want
+  `-S all` to run without hitting `ENOMEM`.
 
 Reference result (64KB, msg endpoint, round-trip): ~5.3 GB/s (~42.7 Gb/s),
 ~12.3 us/xfer. Lower than the one-way `ib_write_bw` throughput above
