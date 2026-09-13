@@ -142,3 +142,23 @@ exact same cable and ports that wouldn't train in IB mode.
 - Bandwidth (64KB, RDMA Write): ~92.5 Gb/s
 - Latency (2B, RDMA Write): ~0.94 us typical/average
 - Message rate (2B, Send): ~3.6 Mpps
+
+## Comparison: native IB vs Ethernet/RoCE vs libfabric
+
+| | Native InfiniBand | Ethernet/RoCE (perftest) | libfabric (`verbs` provider) |
+|---|---|---|---|
+| Tooling | `ib_write_bw`, etc. | `ib_write_bw`, `ib_write_lat`, `ib_send_bw` | `fi_pingpong` |
+| Link status here | Never came up (`phys_state: Disabled`) | `PORT_ACTIVE` / `LinkUp` | Same link as RoCE column — libfabric rides on top of the `rocep*` ibverbs device |
+| Requires cable IB certification | Yes — blocked us | No | No |
+| Requires Subnet Manager | Yes — would have blocked us too | No | No |
+| API level | Raw verbs | Raw verbs | OFI abstraction over verbs (portable across verbs/EFA/PSM2/tcp/etc without app changes) |
+| Bandwidth (64KB) | n/a (link never up) | ~92.5 Gb/s (one-way RDMA Write) | ~42.7 Gb/s round-trip (ping-pong, not directly comparable to one-way BW) |
+| Latency | n/a | ~0.94 us (2B, RDMA Write) | ~12.3 us/xfer (64KB round-trip, includes full request/ack cycle) |
+
+Key takeaway: native IB and RoCE ultimately move data the same way — both
+go through the same `ib_core`/`mlx5_ib` verbs stack and the same NIC
+hardware. The difference here was entirely in **link establishment**
+(see below), not in the RDMA data path itself. libfabric doesn't add a
+new transport; it's a portable API sitting on top of the same verbs
+device, so its numbers reflect the underlying RoCE link plus libfabric's
+own protocol/framing overhead rather than a competing fabric.
