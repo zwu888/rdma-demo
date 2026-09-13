@@ -202,6 +202,40 @@ apples-to-apples comparison — two effects stack up:
 | `fi_pingpong` | 2B | 2.30 us |
 | `fi_pingpong` | 64KB | 12.3 us |
 
+### Why libfabric's bandwidth is lower too
+
+Same root causes as the latency gap, but one factor dominates for
+bandwidth specifically:
+
+1. **No pipelining (the main factor).** `ib_write_bw` keeps 128 RDMA
+   writes outstanding at once (`TX depth: 128`), overlapping each
+   message's latency so the link stays saturated — that's how it reaches
+   near-line-rate (92.5 Gb/s). `fi_pingpong` does the opposite by design:
+   it sends one message, waits for the full round-trip ack, then sends
+   the next. With nothing overlapped, throughput is capped at
+   `message_size / round_trip_time`, not by the link's real capacity.
+   Check the math: 64KB / 11.64us RTT (tuned run) is ~45 Gb/s — almost
+   exactly what was measured. It isn't hitting a hardware ceiling; it's
+   just never given more than one in-flight request to hide latency
+   behind.
+
+2. **Two-sided vs one-sided.** Same as the latency explanation above —
+   `ib_write_bw` is one-sided RDMA Write; `fi_pingpong` is two-sided
+   Send/Recv with a posted receive buffer and completion on both ends.
+
+3. **Abstraction overhead (minor).** libfabric's OFI layer adds a
+   provider-agnostic dispatch (`fi_*` calls into the `verbs` provider)
+   versus perftest calling `ibv_post_send`/`ibv_poll_cq` directly. Real,
+   but small next to #1 and #2.
+
+A true apples-to-apples libfabric bandwidth number would need a pipelined
+benchmark — e.g. `fi_msg_bw` from the `fabtests` suite (posts many
+outstanding sends, like `ib_write_bw` does), rather than `fi_pingpong`.
+`fabtests` isn't included in the `libfabric-bin` package installed here,
+only `fi_pingpong`/`fi_msg_pingpong`-style tools, so this repo's libfabric
+numbers should be read as a two-sided, unpipelined latency-bound
+benchmark rather than a saturation bandwidth test.
+
 ### Tuning libfabric
 
 Every perftest/libfabric run logged `CPU Frequency is not max` — both
