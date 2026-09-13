@@ -239,6 +239,17 @@ Subnet Manager dependency — link-up is link-up. That's confirmed by the
 link coming up immediately after the `mstfwreset` in Ethernet mode, on the
 exact same cable and ports that wouldn't train in IB mode.
 
+## TODO
+
+- [ ] Fix `fi_bw -P tcp` (`src/fi_bw.cpp`): the per-connection endpoint
+  built from the `FI_CONNREQ` info tries to rebind to the passive
+      endpoint's own listening address:port, and the `tcp` provider
+      rejects that with `EADDRINUSE`. Only affects `-P tcp` — `-P verbs`
+      (the default) is unaffected. See the `TODO` comment in
+      `run_server()` and the "TCP baseline" section above, where
+      `fi_pingpong -p tcp` was used as a workaround for the TCP numbers
+      instead.
+
 ## Reference results (2026-09-12, direct cable, 100Gb ConnectX-4)
 
 - Bandwidth (64KB, RDMA Write): ~92.5 Gb/s

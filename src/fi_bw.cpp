@@ -302,6 +302,14 @@ static void run_server(const Config &cfg) {
     fi_eq_cm_entry entry{};
     fi_info *conn_info = wait_for_event(e.eq, FI_CONNREQ, &entry);
 
+    // TODO: fix -P tcp. fi_endpoint(domain, conn_info, ...) below tries to
+    // bind the new per-connection endpoint to the same address:port the
+    // passive endpoint is already listening on, which the tcp provider
+    // rejects with EADDRINUSE (the verbs provider doesn't hit this --
+    // each connection gets its own RDMA_CM identifier, no shared socket
+    // to collide on). Works fine for -P verbs; only tcp is broken. See
+    // the "TCP baseline" section of README.md for how fi_pingpong was
+    // used instead in the meantime.
     open_cqs_and_enable(e, conn_info, cfg.window);
     CHECK("fi_accept", fi_accept(e.ep, NULL, 0));
     wait_for_event(e.eq, FI_CONNECTED, &entry);
