@@ -947,6 +947,49 @@ message size rather than a 64KB bandwidth-test payload) is still
 missing for a fair apples-to-apples comparison at that end of the
 tradeoff.
 
+#### Why RDMA's tail is worse despite better typical-case latency
+
+This split — RDMA ~2x faster through p99, but its worst case ~45x worse
+than DPDK's — has two different causes, not one:
+
+**Why window=16's *median* is higher than window=1's** (~99us vs ~1.6us)
+is simple: message size (64KB vs 2B — pure serialization time alone
+accounts for microseconds) plus queueing (each reported completion
+includes time spent behind up to 15 other outstanding sends). Not a
+fabric limitation, just what "in flight" means under pipelining.
+
+**Why RDMA's *tail* (2.59ms) ends up worse than DPDK's tail (57.6us)**,
+despite RDMA's typical case being better, is a real architectural
+difference. RDMA's RC (Reliable Connection) transport has retry logic
+the application never sees: each QP has an ACK timeout and retry-count
+(IB spec defaults are commonly in the low-millisecond range per retry).
+If anything transient goes wrong at the wire level — a delayed ACK, a
+momentary link hiccup, a dropped packet needing hardware retransmission
+— the QP's reliability state machine retries internally, and the
+completion (CQE) only fires once the operation *fully* succeeds,
+retries included. From the application's point of view, the whole retry
+cycle just looks like one unusually slow completion. The 2.59ms outlier
+lines up suspiciously well with typical RC retry-timeout magnitudes —
+a strong hint this is a single transient hiccup absorbed by RC's
+reliability guarantee, not evidence of anything wrong with the fabric
+itself.
+
+DPDK's raw UDP send has no equivalent mechanism: it's connectionless
+and send-and-forget at the transport level. If a packet were actually
+lost, there'd be no silent retry to hide it — this repo's own client
+code would have caught it via its 1-second timeout and logged it
+explicitly (and in the captured runs, zero timeouts occurred, meaning
+no such event happened during that window). So DPDK's tail reflects
+pure OS/scheduling noise on the polling loop, while RDMA's tail can
+additionally include invisible transport-level reliability recovery —
+a cost paid rarely, but all at once when it triggers.
+
+**The tradeoff in one line:** RC's reliability is exactly what gives
+RDMA its excellent typical-case latency and correctness guarantees (no
+app-level retry logic needed) — and that same reliability layer is
+where its rare, larger tail-latency events come from, which DPDK's raw
+unreliable transport simply doesn't have.
+
 #### Architecture
 
 ```mermaid
