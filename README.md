@@ -933,45 +933,58 @@ above is exactly the deciding factor:
 #### DPDK vs RDMA for control applications
 
 Same percentile methodology, same tuned host, applied to `fi_bw`'s RDMA
-results (see "Jitter and latency distribution" above) for a direct
-comparison:
+results (see "Jitter and latency distribution" above) and `ibv_bw`'s
+raw-verbs results (see "Custom raw ibverbs C++ perf tool" below) for a
+direct comparison:
 
-| Percentile | DPDK (`dpdk_perf`, ~60B UDP) | RDMA window=1 (2B, unpipelined) | RDMA window=16 (64KB, pipelined) |
-|---|---|---|---|
-| p50 | 3.684 us | **1.601 us** | 98.753 us |
-| p90 | 3.805 us | 1.626 us | 104.321 us |
-| p99 | 4.146 us | **2.070 us** | 111.361 us |
-| p99.9 | 14.799 us | 105.045 us | 117.290 us |
-| max | 57.558 us | **2.59 ms** | 125.520 us |
+| Percentile | DPDK (`dpdk_perf`, ~60B UDP) | libfabric RDMA, w=1 (2B) | libfabric RDMA, w=16 (64KB, pipelined) | raw ibverbs (`ibv_bw`), w=1 (2B) |
+|---|---|---|---|---|
+| p50 | 3.684 us | 1.601 us | 98.753 us | **1.282 us** |
+| p90 | 3.805 us | 1.626 us | 104.321 us | 1.351 us |
+| p99 | 4.146 us | 2.070 us | 111.361 us | **1.449 us** |
+| p99.9 | 14.799 us | 105.045 us | 117.290 us | **15.310 us** |
+| max | 57.558 us | 2.59 ms | 125.520 us | **15.310 us** |
 
-**Typical case: RDMA wins decisively.** Window=1 RDMA is ~2x lower
-latency than DPDK through p99 (sub-2us vs ~4us) — expected, since it's
-a one-sided RDMA write with hardware doing the placement, versus DPDK's
-userspace packet processing on both ends.
+**Typical case: raw ibverbs wins outright, RDMA (either API) beats DPDK
+decisively.** `ibv_bw`'s p50/p99 (1.282us/1.449us) are the lowest of
+all four — expected, since it's the same one-sided RDMA write path as
+`fi_bw` with zero libfabric abstraction on top. Both RDMA paths beat
+DPDK by ~2-3x through p99 (sub-2us vs ~4us), since RDMA's one-sided
+write lets hardware place data directly while DPDK still does userspace
+packet processing on both ends.
 
-**Tail: DPDK wins decisively.** DPDK's worst case (57.6us) is roughly
-**45x tighter** than RDMA window=1's worst case (2.59ms). That single
-RDMA outlier is a real red flag for anything with a hard deadline —
-likely the same class of OS-scheduling/interrupt cause as DPDK's tail,
-but hitting far harder on this particular verbs/RC-QP path in this test.
+**Tail: raw ibverbs is dramatically tighter than libfabric's RDMA path,
+though still short of DPDK's.** `ibv_bw`'s max (15.3us) is ~170x
+tighter than `fi_bw`'s window=1 max (2.59ms) at the *same* message size
+and window depth, using the *same* underlying RC QP mechanism — this
+gap is likely a combination of `fi_bw`'s libfabric/RDMA_CM connection
+setup carrying more state than `ibv_bw`'s hand-rolled QP bring-up, and
+plain sample-count luck (`ibv_bw`'s numbers are from n=500 runs, capped
+below the ACK-path issue documented below `fi_bw` doesn't hit in the
+same way — not a guarantee `ibv_bw` would stay this tight at n=5000).
+DPDK's worst case (57.6us) is still ~3.8x tighter than raw ibverbs'
+15.3us, and ~170,000x tighter than libfabric's 2.59ms outlier.
 
-**Pipelining flips the tradeoff entirely.** RDMA window=16 has the
-tightest, most bounded tail of all three (max only ~1.27x its own
-median) — but at ~99us typical latency, both too slow for a tight
-control loop and using an unrepresentative 64KB payload rather than a
-real control message size.
+**Pipelining flips the tradeoff entirely.** libfabric RDMA at window=16
+has the tightest, most bounded tail of the RDMA options (max only
+~1.27x its own median) — but at ~99us typical latency, both too slow
+for a tight control loop and using an unrepresentative 64KB payload
+rather than a real control message size.
 
 **Net indication:** for the *lowest possible typical latency* with
-tolerance for rare misses (soft real-time), window=1 RDMA is the best
-number in this repo. For a *bounded worst case* (hard real-time),
-neither fabric is safely usable as tested — DPDK's tail is the least
-bad of the untuned options, but "least bad" isn't "proven safe." The
-real-time isolation work (`isolcpus`, IRQ affinity, `PREEMPT_RT`) is a
-prerequisite for either fabric before trusting it with a hard deadline,
-and a small-message/small-window RDMA test (matching a real control
-message size rather than a 64KB bandwidth-test payload) is still
-missing for a fair apples-to-apples comparison at that end of the
-tradeoff.
+tolerance for rare misses (soft real-time), raw ibverbs (`ibv_bw`)
+window=1 is the best number in this repo, with libfabric's `fi_bw` a
+close second. For a *bounded worst case* (hard real-time), none of the
+RDMA options are safely usable as tested — DPDK's tail is the least bad
+of the untuned options, but "least bad" isn't "proven safe," and
+`ibv_bw`'s own latency mode has a documented, unresolved hardware-level
+ACK-path issue (see below) that makes its tail numbers provisional
+rather than fully trustworthy. The real-time isolation work
+(`isolcpus`, IRQ affinity, `PREEMPT_RT`) is a prerequisite for any of
+these before trusting one with a hard deadline, and a small-message/
+small-window pipelined RDMA test (matching a real control message size
+rather than a 64KB bandwidth-test payload) is still missing for a fair
+apples-to-apples comparison at that end of the tradeoff.
 
 #### Why RDMA's tail is worse despite better typical-case latency
 
