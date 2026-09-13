@@ -81,6 +81,34 @@ scripts/run.sh client bw 192.168.100.2
 
 Test types: `bw` (bandwidth), `lat` (latency), `rate` (small-message rate).
 
+## libfabric demo
+
+Same fabric, different API layer: `fi_pingpong` (from `libfabric-bin`)
+exercises the `verbs` provider, which sits on top of the same `rocep*`
+ibverbs devices used above.
+
+```bash
+# on hpz6g4 (server)
+scripts/run_libfabric.sh server
+
+# on hpz8g4 (client)
+scripts/run_libfabric.sh client 192.168.100.2
+```
+
+Notes:
+- `-e msg` is required. The default endpoint type (`dgram`) doesn't match
+  the `rocep*` domain's `FI_EP_MSG` type (`FI_PROTO_RDMA_CM_IB_RC`), so
+  `fi_getinfo()` fails with "No data available" if you omit it.
+- Avoid `-S all`: the default `RLIMIT_MEMLOCK` (8MB, `ulimit -l`) on these
+  hosts is too small for the larger sizes in fi_pingpong's default sweep,
+  and `fi_mr_reg()` fails with `ENOMEM` partway through. The script pins a
+  single size (default 64KB) instead.
+
+Reference result (64KB, msg endpoint, round-trip): ~5.3 GB/s (~42.7 Gb/s),
+~12.3 us/xfer. Lower than the one-way `ib_write_bw` throughput above
+because pingpong is a request/ack round trip rather than a streamed,
+multi-outstanding-request transfer.
+
 ## Why native IB mode didn't work
 
 Both ports initially sat at `state: DOWN` / `phys_state: Disabled` in native
