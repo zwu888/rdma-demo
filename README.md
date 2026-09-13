@@ -807,6 +807,31 @@ determinism" rather than a statement about DPDK's own ceiling — a fully
 isolated setup (isolcpus + IRQ affinity + PREEMPT_RT) would be expected
 to tighten the p99.9/max tail substantially.
 
+#### Does this fit a software-defined control application?
+
+Depends on which kind of "control," and the p50/p99 vs p99.9/max split
+above is exactly the deciding factor:
+
+- **Soft real-time / SDN-style control** (flow programming, telemetry-
+  driven control loops, orchestration, most 5G RAN control-plane work)
+  — **yes, fits comfortably.** p50-p99 at 3.7-4.1us with 0% loss is well
+  within typical control-loop budgets (usually ms-scale), and this is
+  exactly the class of problem DPDK's kernel-bypass, no-interrupt
+  architecture is built for.
+- **Hard real-time closed-loop control** (motor drives, protection
+  relays, motion-control axis sync — anything with a guaranteed
+  worst-case deadline, often sub-10-100us) — **not demonstrated here.**
+  The number that matters for a hard deadline is the tail, not the
+  median: p99.9=14.8us and max=57.6us would blow a tight microsecond-
+  class budget roughly 1-in-1000 to 1-in-thousands cycles. This isn't a
+  DPDK ceiling — it's this host's un-isolated Linux (no `isolcpus`, no
+  IRQ affinity tuning, not `PREEMPT_RT`) — but it wasn't fixed or
+  re-measured in this repo, so treat "fits hard real-time control" as
+  unproven rather than confirmed. The real-time isolation setup
+  described above (CPU isolation + IRQ affinity + `PREEMPT_RT`) would
+  need to be done and the percentile test re-run before trusting this
+  path for a hard-deadline control application.
+
 #### Architecture
 
 ```mermaid
