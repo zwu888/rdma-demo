@@ -478,8 +478,9 @@ survive a restart.
 
 ## DPDK compatibility
 
-DPDK isn't installed here, but it's worth documenting whether it *could*
-run alongside the RDMA setup above without disrupting it.
+DPDK is installed on both hosts (see "Setup" below) alongside the RDMA
+setup above — this section documents whether/how it coexists without
+disrupting the RDMA path.
 
 **Why a basic setup is safe:** DPDK's `mlx5` PMD attaches to the
 ConnectX-4 through the same `mlx5_core`/`mlx5_ib` kernel driver and
@@ -492,11 +493,42 @@ tools have done exactly that all session — perftest, `fi_pingpong`, and
 no conflicts). A default-mode `dpdk-testpmd` run wouldn't touch the RDMA
 path or require any link reset.
 
-Missing prerequisites if you do want to try it: the `dpdk`/`dpdk-dev`
-packages (not installed), hugepages (`HugePages_Total: 0` currently —
-reserve some via `vm.nr_hugepages` before running any DPDK app). IOMMU
-is already active (165 IOMMU groups) and `hugetlbfs` is already mounted
-at `/dev/hugepages`.
+### Setup (done on both hosts)
+
+```bash
+sudo apt-get install -y dpdk dpdk-dev libdpdk-dev
+
+# reserve 1024 x 2MB = 2GB hugepages, and make it persist across reboots
+sudo sysctl -w vm.nr_hugepages=1024
+echo 'vm.nr_hugepages=1024' | sudo tee /etc/sysctl.d/60-dpdk-hugepages.conf
+```
+
+IOMMU was already active (165 IOMMU groups) and `hugetlbfs` was already
+mounted at `/dev/hugepages`, so those needed no changes.
+
+Verified the bifurcated model held after installing — the ConnectX-4 is
+still bound to the kernel driver, not `vfio-pci`, and both the netdev and
+the RDMA device remain live:
+
+```
+$ dpdk-devbind.py --status
+Network devices using kernel driver
+===================================
+0000:15:00.0 'MT27700 Family [ConnectX-4] 1013' numa_node=0 if=enp21s0np0 drv=mlx5_core unused= *Active*
+```
+
+**Not done, deliberately:** actually launching `dpdk-testpmd` against the
+live port. DPDK's default (non-isolated) flow mode can install steering
+rules that capture unicast traffic matching the port's MAC for its RX
+queues. RoCEv2 is UDP (port 4791) over IP, so depending on exactly how
+this mlx5 firmware/driver partitions its steering domains between
+"Ethernet netdev RX" and "RDMA raw QP," a naive `testpmd` run could
+plausibly intercept traffic on the same `192.168.100.x` addresses the
+RDMA/OOB-control setup uses — this wasn't verified either way. If you
+want to actually run a DPDK forwarding app here, use
+`--flow-isolate-mode` (or otherwise restrict it to explicit `rte_flow`
+rules) rather than the default wildcard capture, and test it first with
+nothing important riding on the link.
 
 **What would actually break the RDMA flow:**
 
