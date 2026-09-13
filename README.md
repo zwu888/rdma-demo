@@ -364,6 +364,26 @@ exact same cable and ports that wouldn't train in IB mode.
       matching packet waiting. No error, no log line -- it just never
       returns a packet. Don't request a burst size of 1 from this PMD.
 
+- [ ] Fix `ibv_bw` latency mode resource exhaustion (`src/ibv_bw.cpp`):
+      sustained runs (n=5000) eventually hit
+      `ibv_post_send(): Cannot allocate memory` on the server's echo
+      path after roughly 1000-1500 round trips -- not immediately (two
+      real bugs *were* found and fixed along the way: a GID-index
+      selection bug causing `ENETUNREACH`, and a shared-CQ undersizing
+      bug causing early `ENOMEM` -- see the "Custom raw ibverbs" section
+      above for both). Switching the echo opcode from
+      `RDMA_WRITE_WITH_IMM` to plain two-sided `IBV_WR_SEND` didn't
+      change the failure at all, ruling out anything opcode-specific.
+      Current workaround: cap `n` well under the failure threshold
+      (n=500 runs consistently clean). Throughput mode (one-sided
+      `RDMA_WRITE`) is unaffected at any iteration count tested (up to
+      20000) -- only the repeated post-completion-repost cycle in
+      latency mode's server hits this. Worth a fresh look at whether
+      it's a real driver/firmware resource pool being exhausted (this
+      ConnectX-4's firmware, `12.18.1000`) versus something still
+      wrong in the repost bookkeeping that isn't obvious from the
+      symptom alone.
+
 ## Reference results (2026-09-12, direct cable, 100Gb ConnectX-4)
 
 - Bandwidth (64KB, RDMA Write): ~92.5 Gb/s
@@ -1124,3 +1144,85 @@ Bottom line: a basic `dpdk-testpmd` run in default legacy mode, with no
 RDMA setup here. SR-IOV/switchdev-style DPDK testing is a separate, more
 invasive step that should be planned for a time when nothing else needs
 the RDMA link live.
+
+## Custom raw ibverbs C++ perf tool (`ibv_bw`)
+
+`src/ibv_bw.cpp` completes the trio alongside `fi_bw.cpp` (libfabric)
+and `dpdk_perf.cpp` (raw DPDK ethdev): no libfabric, no `rdma_cm` — just
+`libibverbs` directly, with QP setup done the classic way (RESET ->
+INIT -> RTR -> RTS by hand, GID/QPN/PSN/rkey/addr exchanged over a
+plain out-of-band TCP socket), the same pattern used in canonical
+raw-verbs examples like rdma-core's own `ibv_rc_pingpong`.
+
+```bash
+# server (hpz6g4)
+./ibv_bw server -d rocep45s0 -s 65536 -w 16 -n 20000 throughput
+
+# client (hpz8g4)
+./ibv_bw client 192.168.100.2 -d rocep21s0 -s 65536 -w 16 -n 20000 throughput
+```
+
+**Throughput mode** (pipelined, one-sided `IBV_WR_RDMA_WRITE`, same
+methodology as `ib_write_bw`): **89.6-89.8 Gb/s** at window 16, 64KB —
+the closest of all three custom tools in this repo to `ib_write_bw`'s
+92.5 Gb/s reference, as expected: raw verbs has the least abstraction
+between the application and the wire.
+
+**Latency mode** (two-sided Send/Recv ping-pong, window=1, 2B), n=500:
+```
+latency us: avg=1.311 min=0.304 max=15.310 stdev=0.639 jitter(rfc3550)=0.125 (n=500)
+latency us percentiles: p50=1.282 p90=1.351 p99=1.449 p99.9=15.310 max=15.310
+```
+p50=1.282us beats even `fi_bw`'s window=1 result — again the expected
+outcome for zero-abstraction raw verbs.
+
+### Two real bugs found and fixed along the way
+
+1. **RoCE v2's GID table has more than one entry tagged the same
+   type**, and only one is usable. `ibv_modify_qp(RTR)` initially failed
+   with `ENETUNREACH` ("Network is unreachable") because the naive
+   "first GID tagged RoCE v2" approach picked the link-local IPv6 GID
+   (`fe80::...`, always present, never routable to a plain IPv4 peer)
+   instead of the actual IPv4-mapped one (`::ffff:192.168.100.x`) at a
+   different index. Both are tagged type "RoCE v2" in
+   `/sys/class/infiniband/<dev>/ports/1/gid_attrs/types/*` — type alone
+   doesn't distinguish them. Fixed by additionally checking the GID's
+   own bytes for the IPv4-mapped pattern (bytes 0-9 zero, bytes 10-11 =
+   `0xff 0xff`), the same way perftest tools do it internally.
+
+2. **A shared CQ needs headroom for both queues combined, not one
+   queue's worth.** `send_cq` and `recv_cq` both point at the same `cq`
+   object here (common for a simple test tool), but `max_send_wr` and
+   `max_recv_wr` were both set to the *same* value as the CQ's own
+   depth — meaning in the worst case (both queues simultaneously near
+   full) you'd need up to 2x the CQ's actual capacity. Manifested as
+   `ibv_post_send()` intermittently failing with `ENOMEM`
+   ("Cannot allocate memory") under sustained load. Fixed by sizing the
+   CQ to `2 * qp_cap + headroom` instead of just `qp_cap`.
+
+A third, easy-to-miss **instrumentation** bug worth calling out
+separately: `ibv_post_send()`/`ibv_post_recv()` return the error code
+directly as their return value — they do **not** set the global
+`errno`. Using a generic `die()` helper that reads `errno` on their
+failure printed a stale, unrelated error left over from some earlier
+syscall (misleadingly showed "Protocol not supported" at one point),
+which cost real debugging time chasing the wrong error entirely. Fixed
+with a `die_rc(what, rc)` helper that formats the actual returned code.
+
+### Known issue: latency mode still exhausts a resource after ~1000-1500 iterations
+
+Even after both fixes above, sustained latency-mode runs (n=5000)
+eventually hit `ibv_post_send(): Cannot allocate memory` on the
+server's echo path — not immediately (ruling out a simple queue-depth
+miscalculation like bug #2 above; `n=500` runs consistently succeed
+cleanly), but reproducibly after roughly 1000-1500 round trips. Tried
+switching the opcode from `RDMA_WRITE_WITH_IMM` to plain two-sided
+`IBV_WR_SEND` (removing dependence on the immediate-data variant
+entirely, and matching `fi_bw`/`dpdk_perf`'s own echo methodology) —
+the failure persisted identically, which rules out anything specific to
+`WRITE_WITH_IMM` and points at something in the repeated
+post-completion-repost cycle itself (or a driver/firmware-level
+resource pool on this ConnectX-4 firmware) rather than the opcode
+choice. Not resolved; the workaround used for the numbers above was
+capping `n` well under the observed failure threshold. Throughput mode
+is unaffected at any iteration count tested (up to 20000).

@@ -5,7 +5,7 @@ LDLIBS   := -lfabric
 DPDK_CFLAGS := $(shell pkg-config --cflags libdpdk)
 DPDK_LIBS   := $(shell pkg-config --libs libdpdk)
 
-all: fi_bw dpdk_perf
+all: fi_bw dpdk_perf ibv_bw
 
 fi_bw: fi_bw.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDLIBS)
@@ -19,7 +19,10 @@ fi_bw-debug: fi_bw.cpp
 dpdk_perf: dpdk_perf.cpp
 	$(CXX) $(CXXFLAGS) $(DPDK_CFLAGS) -o $@ $< $(DPDK_LIBS)
 
+ibv_bw: ibv_bw.cpp
+	$(CXX) $(CXXFLAGS) -o $@ $< -libverbs
+
 clean:
-	rm -f fi_bw fi_bw-debug dpdk_perf
+	rm -f fi_bw fi_bw-debug dpdk_perf ibv_bw
 
 .PHONY: clean all
