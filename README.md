@@ -245,7 +245,21 @@ apples-to-apples comparison — two effects stack up:
 |---|---|---|
 | `ib_write_lat` | 2B | 0.94 us |
 | `fi_pingpong` | 2B | 2.30 us |
+| `fi_bw` (`-w 1`, our program) | 2B | 3.75 us |
 | `fi_pingpong` | 64KB | 12.3 us |
+
+`fi_bw -w 1` (one outstanding send, waiting for its completion before
+posting the next — see the libfabric bandwidth demo section below) is a
+third data point on the same spectrum: still Send/Recv (two-sided, needs
+a receive buffer posted on the far end) like `fi_pingpong`, but without
+`fi_pingpong`'s explicit application-level send-then-wait-for-a-separate-
+ack-message protocol — just the send completion itself. It lands higher
+than `fi_pingpong`'s 2.30us here, which is a reminder that these
+mini-benchmarks (a plain busy-poll loop, no warm-up, 5000 iterations) are
+illustrative, not tightly controlled — take the relative ordering
+(one-sided inline write < two-sided send-completion-only < two-sided
+explicit ping-pong) as the reliable signal, not small differences between
+runs.
 
 ### Why libfabric's bandwidth is lower too
 
