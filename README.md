@@ -517,18 +517,50 @@ Network devices using kernel driver
 0000:15:00.0 'MT27700 Family [ConnectX-4] 1013' numa_node=0 if=enp21s0np0 drv=mlx5_core unused= *Active*
 ```
 
-**Not done, deliberately:** actually launching `dpdk-testpmd` against the
-live port. DPDK's default (non-isolated) flow mode can install steering
-rules that capture unicast traffic matching the port's MAC for its RX
-queues. RoCEv2 is UDP (port 4791) over IP, so depending on exactly how
-this mlx5 firmware/driver partitions its steering domains between
-"Ethernet netdev RX" and "RDMA raw QP," a naive `testpmd` run could
-plausibly intercept traffic on the same `192.168.100.x` addresses the
-RDMA/OOB-control setup uses — this wasn't verified either way. If you
-want to actually run a DPDK forwarding app here, use
-`--flow-isolate-mode` (or otherwise restrict it to explicit `rte_flow`
-rules) rather than the default wildcard capture, and test it first with
-nothing important riding on the link.
+### Validated: flow-isolated testpmd coexists cleanly
+
+Tested this directly rather than leaving it as a guess. Note the correct
+flag is `--flow-isolate-all` (not `--flow-isolate-mode`, which doesn't
+exist and errors out):
+
+```bash
+sudo dpdk-testpmd -l 0-2 -n 4 -a 0000:15:00.0 -- --flow-isolate-all
+```
+
+The log confirms isolation actually took effect before any port state
+changed:
+
+```
+Ingress traffic on port 0 is now restricted to the defined flow rules
+...
+mlx5_net: port 0 cannot enable promiscuous mode in flow isolation mode
+```
+
+**Test procedure:** measured `fi_bw` (64KB, window 16) three times —
+before starting `testpmd`, concurrently while it was running (holding its
+own RX/TX queue on the same port, isolated, forwarding nothing since no
+explicit `rte_flow` rules were added), and again after a clean shutdown:
+
+| | Bandwidth |
+|---|---|
+| Before `testpmd` | 82.93 Gb/s |
+| While `testpmd` running | 82.03 Gb/s |
+| After `testpmd` exit | 83.03 Gb/s |
+
+All three within ~1% of each other — no measurable regression. RoCE port
+state stayed `ACTIVE` and the kernel netdev stayed `UP` throughout, and
+`testpmd` shut down cleanly (`Port 0 is closed` / `Bye...`) without
+requiring a link reset. This confirms the theoretical bifurcated-model
+argument above with an actual measurement: a flow-isolated DPDK app can
+run against this NIC alongside the RDMA path with no impact, as long as
+you don't add `rte_flow` rules that redirect traffic the RDMA path
+depends on.
+
+Still untested: whether a *non-isolated* `testpmd` run (default flow
+mode, no `--flow-isolate-all`) would actually steal RoCEv2/OOB-control
+traffic as theorized above. Given isolation mode works and coexists
+cleanly, there was no reason to test the riskier non-isolated path
+against a live link.
 
 **What would actually break the RDMA flow:**
 
