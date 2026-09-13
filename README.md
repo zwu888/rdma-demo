@@ -224,6 +224,48 @@ closes almost all of that gap using the same libfabric `verbs` provider —
 confirming the earlier explanation that lack of pipelining, not libfabric
 overhead, was the dominant factor in `fi_pingpong`'s lower bandwidth.
 
+### Jitter and latency distribution
+
+`fi_bw` also tracks per-completion latency (send timestamp to CQ
+completion, per buffer slot) and reports the same stdev / RFC 3550 mean
+jitter / percentile breakdown used for the DPDK evaluation above — same
+methodology, so the two are directly comparable.
+
+**Window=1 (2B, true serialized RTT), tuned, n=5000:**
+```
+latency us: avg=3.887 min=1.547 max=2593.873 stdev=71.773 jitter(rfc3550)=4.558 (n=5000)
+latency us percentiles: p50=1.601 p90=1.626 p99=2.070 p99.9=105.045 max=2593.873
+```
+
+**Window=16 (64KB, pipelined), tuned, n=20000:**
+```
+latency us: avg=99.307 min=20.550 max=125.520 stdev=3.296 jitter(rfc3550)=1.093 (n=20000)
+latency us percentiles: p50=98.753 p90=104.321 p99=111.361 p99.9=117.290 max=125.520
+```
+
+Two things worth noting:
+
+1. **The window=1 tail looks a lot like DPDK's tail.** p50-p99 is tight
+   (1.6-2.1us), then a jump at p99.9 (105us) and one extreme outlier at
+   max (2.59ms) — the same "tight body, long tail past p99" shape as the
+   DPDK determinism results above, on a completely different stack
+   (libfabric/verbs/RC QP vs raw ethdev). That's a useful cross-check:
+   the tail is very likely this host's un-isolated Linux environment
+   (scheduling, interrupts, C-states) showing up regardless of which
+   kernel-bypass fabric sits on top of it, not something specific to
+   either DPDK or libfabric.
+2. **Window=16's latency is higher but far more tightly bounded** (max
+   125.5us vs window=1's 2.59ms outlier) despite moving 64KB instead of
+   2B per message. This is the pipelining tradeoff made concrete: each
+   reported completion now includes time queued behind up to 15 other
+   outstanding sends (hence the ~99us average, mostly serialization time
+   for 64KB payloads plus queueing), but with many requests in flight, a
+   single slow completion doesn't stall the whole pipeline the way it
+   can when there's only one outstanding request — so the *tail*
+   actually tightens even though the *median* rises. Window depth is a
+   throughput-vs-latency-distribution-shape knob, not just a
+   throughput-vs-average-latency one.
+
 Reference result (64KB, msg endpoint, round-trip): ~5.3 GB/s (~42.7 Gb/s),
 ~12.3 us/xfer. Lower than the one-way `ib_write_bw` throughput above
 because pingpong is a request/ack round trip rather than a streamed,

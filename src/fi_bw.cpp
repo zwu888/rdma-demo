@@ -35,12 +35,20 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+static uint64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 struct Config {
     bool is_server = false;
@@ -272,6 +280,48 @@ static void print_result(const Config &cfg, double elapsed_s) {
            cfg.window, elapsed_s, gbits, mbps, usec_per_xfer, mmsgs);
 }
 
+// Per-completion latency stats, same methodology as dpdk_perf's latency
+// mode: stdev (spread around the mean) and RFC 3550 mean jitter
+// (average consecutive-sample change) answer different questions, and
+// percentiles are what actually show a long tail that avg/stdev alone
+// can hide. Note: at window > 1 this is completion latency *under
+// pipelined load* (queued behind other outstanding sends), not a
+// strictly serialized RTT like `-w 1` gives -- expect it to rise with
+// window depth, and that's not a regression, it's the tradeoff for the
+// higher throughput pipelining buys (see README).
+static void print_latency_stats(std::vector<double> &lat_us) {
+    if (lat_us.empty()) return;
+    double sum = 0, mn = lat_us[0], mx = lat_us[0];
+    for (double v : lat_us) {
+        sum += v;
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+    }
+    double avg = sum / lat_us.size();
+    double var_sum = 0;
+    for (double v : lat_us) var_sum += (v - avg) * (v - avg);
+    double stdev = std::sqrt(var_sum / lat_us.size());
+    double rfc3550_sum = 0;
+    for (size_t i = 1; i < lat_us.size(); i++)
+        rfc3550_sum += std::fabs(lat_us[i] - lat_us[i - 1]);
+    double rfc3550_jitter =
+        lat_us.size() > 1 ? rfc3550_sum / (lat_us.size() - 1) : 0.0;
+
+    std::vector<double> sorted = lat_us;
+    std::sort(sorted.begin(), sorted.end());
+    auto pct = [&](double p) {
+        size_t idx = (size_t)std::ceil(p * sorted.size()) - 1;
+        idx = std::min(idx, sorted.size() - 1);
+        return sorted[idx];
+    };
+    printf("latency us: avg=%.3f min=%.3f max=%.3f stdev=%.3f "
+           "jitter(rfc3550)=%.3f (n=%zu)\n",
+           avg, mn, mx, stdev, rfc3550_jitter, lat_us.size());
+    printf("latency us percentiles: p50=%.3f p90=%.3f p99=%.3f p99.9=%.3f "
+           "max=%.3f\n",
+           pct(0.50), pct(0.90), pct(0.99), pct(0.999), sorted.back());
+}
+
 static void run_server(const Config &cfg) {
     fi_info *hints = make_hints(cfg, /*constrain_ep_type=*/false);
     fi_info *info = nullptr;
@@ -385,12 +435,17 @@ static void run_client(const Config &cfg) {
     void *desc = fi_mr_desc(mr);
 
     std::vector<fi_context> ctx(cfg.window);
+    std::vector<uint64_t> send_ns(cfg.window);
+    std::vector<double> lat_us;
+    lat_us.reserve(cfg.iters);
     long posted = std::min<long>(cfg.window, cfg.iters);
 
     auto t0 = std::chrono::steady_clock::now();
-    for (long i = 0; i < posted; i++)
+    for (long i = 0; i < posted; i++) {
+        send_ns[i] = now_ns();
         CHECK("fi_send", fi_send(e.ep, buf.data() + i * cfg.size, cfg.size, desc,
                                   0, &ctx[i]));
+    }
 
     long completed = 0;
     while (completed < cfg.iters) {
@@ -405,7 +460,9 @@ static void run_client(const Config &cfg) {
         }
         completed++;
         size_t idx = (fi_context *)cqe.op_context - ctx.data();
+        lat_us.push_back((now_ns() - send_ns[idx]) / 1000.0);
         if (posted < cfg.iters) {
+            send_ns[idx] = now_ns();
             CHECK("fi_send", fi_send(e.ep, buf.data() + idx * cfg.size, cfg.size,
                                       desc, 0, &ctx[idx]));
             posted++;
@@ -414,6 +471,7 @@ static void run_client(const Config &cfg) {
     auto t1 = std::chrono::steady_clock::now();
     double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
     print_result(cfg, elapsed_s);
+    print_latency_stats(lat_us);
 
     fi_close(&mr->fid);
     fi_close(&e.ep->fid);
