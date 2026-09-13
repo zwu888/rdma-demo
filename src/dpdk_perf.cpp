@@ -9,17 +9,18 @@
 // that traffic to queue 0. Nothing else is ever redirected away from
 // the kernel/RDMA path.
 //
-// An earlier version of this program matched on a raw, non-IP EtherType
-// (0x88B5) instead. That flow rule was accepted by rte_flow_create() and
-// the *sender* side worked (server received frames fine), but replies
-// never made it back: the client's raw port stats showed ipackets=0
-// even though the server's tx_burst() reported success. Best working
-// theory: this ConnectX-4's flow steering hardware doesn't reliably
-// classify/deliver arbitrary non-IP EtherTypes in isolated mode, even
-// though the rte_flow API layer accepts the rule without error. Every
-// DPDK test elsewhere in this repo that actually moved traffic
-// end-to-end (testpmd's throughput and icmpecho latency tests) used
-// real IPv4/UDP or ICMP framing -- this program now does too.
+// An earlier version matched on a raw, non-IP EtherType (0x88B5)
+// instead of UDP; that was one of two bugs fixed during development
+// (rewritten to real IPv4/UDP framing to match the proven-working
+// testpmd pattern). The other, much less obvious one: the latency
+// mode's round trip was calling rte_eth_rx_burst(port, queue, buf, 1)
+// -- requesting exactly one packet -- which this mlx5 PMD silently
+// returns 0 for, forever, even when a matching packet is waiting.
+// Bumping the requested burst size to 32 (while still only consuming
+// the first packet received) fixed it completely. Both are worth
+// knowing if you're writing your own mlx5/DPDK code: don't assume a
+// non-IP EtherType will be reliably classified in isolated mode, and
+// don't call rte_eth_rx_burst() with nb_pkts=1 on this PMD.
 //
 // Usage:
 //   dpdk_perf [EAL args] -- server|client <peer-mac> <own-ip> <peer-ip>
@@ -273,9 +274,9 @@ static void run_server_latency(const rte_ether_addr &own_mac, uint32_t own_ip) {
             auto *udp = (rte_udp_hdr *)(ip + 1);
             auto *payload = (Payload *)(udp + 1);
             uint32_t total_len = rte_pktmbuf_pkt_len(bufs[i]);
-            replies[nreplies++] =
-                make_packet(mp, own_mac, eth->src_addr, own_ip, ip->src_addr,
-                            payload->seq, total_len);
+            rte_mbuf *reply = make_packet(mp, own_mac, eth->src_addr, own_ip,
+                                           ip->src_addr, payload->seq, total_len);
+            replies[nreplies++] = reply;
             rte_pktmbuf_free(bufs[i]);
         }
         if (nreplies > 0) {
@@ -343,10 +344,12 @@ static void run_client_latency(const rte_ether_addr &own_mac,
         }
         // wait for the echoed reply, bounded so a lost packet can't hang
         // the whole run -- report progress along the way for visibility.
-        rte_mbuf *rx[1];
+        // Request a burst of 32 (matching the working server code), not 1:
+        // requesting nb_pkts=1 from rte_eth_rx_burst() is the suspected bug.
+        rte_mbuf *rx[32];
         uint16_t got = 0;
         while (got == 0 && (now_ns() - send_ns) < 1'000'000'000ULL)
-            got = rte_eth_rx_burst(kPortId, 0, rx, 1);
+            got = rte_eth_rx_burst(kPortId, 0, rx, 32);
         if (got == 0) {
             timeouts++;
             if (timeouts <= 5)
@@ -354,7 +357,7 @@ static void run_client_latency(const rte_ether_addr &own_mac,
             continue;
         }
         uint64_t recv_ns = now_ns();
-        rte_pktmbuf_free(rx[0]);
+        for (uint16_t k = 0; k < got; k++) rte_pktmbuf_free(rx[k]);
         rtts_us.push_back((recv_ns - send_ns) / 1000.0);
         if (i > 0 && i % 500 == 0) {
             printf("... %ld/%ld done (%ld timeouts so far)\n", i, iters,

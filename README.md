@@ -268,18 +268,16 @@ exact same cable and ports that wouldn't train in IB mode.
       `fi_pingpong -p tcp` was used as a workaround for the TCP numbers
       instead.
 
-- [ ] Fix `dpdk_perf` latency mode (`src/dpdk_perf.cpp`): the server's
-      echoed reply never reaches the client. Throughput mode (one-way
-      client-to-server) works and is validated (500000/500000 frames,
-      83.5 Gb/s). Only the echo/round-trip path is broken.
-
-      **Symptom:** client's own `rte_eth_stats_get()` shows
-      `ipackets=0, imissed=0, rx_nombuf=0` after every attempt — not
+- [x] ~~Fix `dpdk_perf` latency mode~~ **Fixed.** (`src/dpdk_perf.cpp`)
+      The server's echoed reply never reached the client — symptom was
+      the client's own `rte_eth_stats_get()` showing
+      `ipackets=0, imissed=0, rx_nombuf=0` after every attempt (not
       "received," not "dropped," just never classified as arriving at
-      all — while the server reports `tx_burst()` fully succeeded for
+      all), while the server reported `tx_burst()` fully succeeded for
       every echo.
 
-      **Debugging trail** (each step ruled something out):
+      **Debugging trail** (each step ruled something out, kept here
+      since the same process would apply to similar mlx5/DPDK bugs):
       1. Original version matched a raw non-IP EtherType (0x88B5).
          Suspected the ConnectX-4's flow steering hardware doesn't
          reliably classify arbitrary non-IP EtherTypes in isolated mode
@@ -288,39 +286,41 @@ exact same cable and ports that wouldn't train in IB mode.
          matching the proven-working `testpmd` pattern) -- no change.
       2. Suspected undersized (runt) frames: the original packet was
          14+16=30 bytes, under Ethernet's 60-byte minimum. Padded to
-         60B -- no change (and the UDP version is naturally 58B+ anyway).
+         60B -- no change.
       3. Suspected RX-mbuf-reuse metadata (leftover RX offload flags
          confusing the TX path) from mutating the received mbuf in
          place for the echo. Rewrote to allocate a fresh mbuf per
          reply instead -- no change.
       4. Used `testpmd` (proven reliable throughout this README) to
          isolate further: `testpmd --forward-mode=mac` on the server
-         (the built-in equivalent of "swap MACs and retransmit") with
-         `testpmd --forward-mode=txonly` blasting traffic from the
-         client. Result: server received and retransmitted ~30.18M
-         packets; client's own counters showed `RX-dropped: ~30.18M`
-         (not `RX-packets`) -- because `txonly` mode never calls
-         `rte_eth_rx_burst()` at all, so its RX ring fills and every
-         matching arrival is dropped. This *proves the round trip
-         mechanism itself works* -- replies do physically arrive and
-         do get classified by the flow rule. It just doesn't explain
-         why my own client (which polls RX continuously, unlike
-         `txonly`) sees literal zeros instead of even a nonzero
-         `imissed` count.
-      5. Confirmed identical `link: UP, speed=100000 Mbps` and
-         `flow rule installed: ... (handle=0x40)` output on both ends;
-         ruled out a silent setup failure.
-      6. Tested with 60 iterations instead of 5 in case of a
-         cold-start/flow-cache-warmup effect -- still 100% timeouts,
-         ruling that out too.
+         with `testpmd --forward-mode=txonly` blasting from the client.
+         Result: server received and retransmitted ~30.18M packets;
+         client's own counters showed `RX-dropped: ~30.18M` (not
+         `RX-packets`) -- because `txonly` mode never calls
+         `rte_eth_rx_burst()`, so its RX ring fills and every matching
+         arrival is dropped. This *proved the round trip mechanism
+         itself works* -- replies do physically arrive and do get
+         classified. It just didn't explain the client's literal zeros.
+      5. Dumped the actual wire bytes of both the client's ping and the
+         server's reply and checked them by hand (MACs, swapped IPs,
+         IP header checksum recomputed manually and matched) -- byte-
+         perfect, no corruption.
+      6. Swapped which physical machine ran the client vs server role.
+         Same result either way -- proved the bug followed the *code
+         path* (client-side receive logic), not either machine's
+         hardware/NUMA topology.
+      7. That pointed at the one remaining difference between the
+         client's and server's receive calls: the client requested
+         `rte_eth_rx_burst(port, queue, buf, 1)` -- exactly one packet
+         -- while the server's working code requested 32. Changing the
+         client to request 32 (only consuming the first packet
+         received) **fixed it immediately**: 2000/2000 round trips,
+         zero timeouts, RTT avg 3.688 us.
 
-      **Net effect:** the failure is specific to my own program's
-      client-side RX path in a way that differs from `testpmd`'s, but
-      exactly how remains unidentified. Given `testpmd icmpecho`
-      already provides a working DPDK latency number (documented
-      above), this wasn't pursued further, but a fresh pair of eyes on
-      `run_client_latency()`/`setup_port()` in `src/dpdk_perf.cpp`
-      might spot something the above process didn't.
+      **Root cause:** this mlx5 PMD silently returns 0 from
+      `rte_eth_rx_burst()` when `nb_pkts=1`, forever, even with a
+      matching packet waiting. No error, no log line -- it just never
+      returns a packet. Don't request a burst size of 1 from this PMD.
 
 ## Reference results (2026-09-12, direct cable, 100Gb ConnectX-4)
 
@@ -713,15 +713,41 @@ sudo ./dpdk_perf -l 0-1 -n 4 -a 0000:15:00.0 -- client \
 
 **Throughput mode works and is validated end-to-end**: 500,000/500,000
 frames received exactly (735,000,000 bytes = 500000 x 1470B, no loss),
-**83.51 Gb/s, 7.1 Mpps** — consistent with the `testpmd`-based
-measurement above (~81.2 Gb/s). This mode only needs the proven
-unidirectional client-to-server path.
+**~85 Gb/s, ~7.2 Mpps** — consistent with the `testpmd`-based
+measurement above (~81.2 Gb/s).
 
-**Latency mode has an open, unresolved bug** (see TODO below): the
-server-side echo-reply never arrives back at the client, even though
-extensive isolation testing proved the round trip mechanism itself
-works (see "Debugging trail" in the TODO entry). Use the `testpmd
-icmpecho` approach above for a working DPDK latency number instead.
+**Latency mode works too, once a real driver bug was found and fixed.**
+It kept failing 100% of the time (`ipackets=0, imissed=0` on the client
+— not even "dropped," just never classified as arriving) despite the
+server correctly receiving every ping and its `tx_burst()` reporting the
+echo sent successfully. Six rounds of isolation testing (raw EtherType
+vs IPv4/UDP framing, runt-frame padding, fresh-mbuf-vs-in-place mutation,
+byte-level hex dumps of the actual wire packets to rule out corruption,
+swapping which physical machine played client vs server) narrowed it to
+the client's own receive call. The actual bug: `run_client_latency()`
+called `rte_eth_rx_burst(port, queue, buf, 1)` — requesting exactly one
+packet — and this mlx5 PMD silently returns 0 for that, forever, even
+with a matching packet waiting. Requesting a burst of 32 instead (while
+still only consuming the first packet received) fixed it immediately.
+Worth knowing for anyone else writing mlx5/DPDK code: **don't call
+`rte_eth_rx_burst()` with `nb_pkts=1`** on this PMD.
+
+```bash
+sudo ./dpdk_perf -l 0-1 -n 4 -a 0000:2d:00.0 -- server \
+    ec:0d:9a:a4:cc:86 192.168.100.2 192.168.100.1 latency
+
+sudo ./dpdk_perf -l 0-1 -n 4 -a 0000:15:00.0 -- client \
+    ec:0d:9a:78:62:72 192.168.100.1 192.168.100.2 latency 64 2000
+```
+
+Result (tuned: performance governor + NUMA pin), 2000/2000 round trips,
+zero timeouts: **RTT avg 3.688 us, min 3.371 us**. This is pure
+DPDK-to-DPDK userspace polling on both ends — no kernel network stack
+anywhere in the path — which is why it's dramatically lower than the
+`testpmd icmpecho` + kernel-`ping` number above (0.099 ms / 99 us): that
+test only removed the kernel stack from the *responder* side, since
+`ping` on the client end still goes through the kernel. This number
+removes it from both.
 
 #### Architecture
 
@@ -738,7 +764,7 @@ sequenceDiagram
     C->>C: (identical setup on its own port)
 
     rect rgb(210, 240, 210)
-    Note over S,C: Throughput mode -- validated, 83.51 Gb/s
+    Note over S,C: Throughput mode -- validated, ~85 Gb/s
     loop bursts of up to 32 frames
         C->>C: make_packet() x N (eth+ipv4+udp+payload)
         C->>S: rte_eth_tx_burst()
@@ -747,24 +773,25 @@ sequenceDiagram
     Note over S: 500000/500000 received, byte count exact
     end
 
-    rect rgb(245, 210, 210)
-    Note over S,C: Latency mode -- broken, root cause unknown
+    rect rgb(210, 240, 210)
+    Note over S,C: Latency mode -- validated, avg 3.688us RTT
     C->>C: make_packet(), record send_ns
     C->>S: rte_eth_tx_burst() [1 frame]
-    S->>S: rte_eth_rx_burst() -- frame received (confirmed in logs)
+    S->>S: rte_eth_rx_burst() -- frame received
     S->>S: build fresh reply mbuf (swap src/dst MAC + IP)
-    S--xC: rte_eth_tx_burst() reports success, but frame never arrives
-    C->>C: rte_eth_rx_burst() spins, hits 1s bound, times out
-    Note over C: rte_eth_stats_get(): ipackets=0, imissed=0 -- not even "dropped"
+    S->>C: rte_eth_tx_burst() -- echo sent
+    C->>C: rte_eth_rx_burst(buf, 32) -- NOT nb_pkts=1, see below
+    Note over C: 2000/2000 round trips, 0 timeouts
     end
 ```
 
-Note the asymmetry the diagram is built around: the same `setup_port()`
-code runs on both sides, and `testpmd`'s `mac`-forward mode proved this
-exact reply mechanism *can* work on this hardware (a separate test, not
-`dpdk_perf` itself) — so the failure is specific to something in this
-program's client-side receive path that six rounds of isolation testing
-didn't identify. See the TODO entry for the full debugging trail.
+The fix that made the bottom half work: requesting `nb_pkts=32` from
+`rte_eth_rx_burst()` instead of `nb_pkts=1`. The latter silently
+returned 0 forever on this mlx5 PMD, even with a matching packet
+waiting — discovered only after `testpmd`'s `mac`-forward mode proved
+the reply mechanism itself worked on this hardware, and swapping which
+physical machine ran the client role proved the bug followed the code
+path rather than either machine.
 
 **What would actually break the RDMA flow:**
 
