@@ -762,6 +762,51 @@ the kernel. This number removes it from both.
   driven by a few isolated outliers rather than a consistently noisy
   signal — a distinction stdev alone wouldn't surface.
 
+#### Is DPDK deterministic?
+
+avg/stdev can look fine while a long tail of rare outliers still exists
+underneath — percentiles are what actually answer this. Ran 10,000
+round trips (tuned: performance governor + NUMA pin) and added
+percentile reporting to `dpdk_perf` to check:
+
+| Percentile | RTT |
+|---|---|
+| p50 | 3.684 us |
+| p90 | 3.805 us |
+| p99 | 4.146 us |
+| p99.9 | 14.799 us |
+| max | 57.558 us |
+
+**Verdict: deterministic through p99, not beyond it.** From p50 to p99
+the RTT stays within about 12% of the median (3.684 -> 4.146 us) — for
+99% of requests, DPDK's poll-mode driver architecture (no interrupts, no
+kernel scheduling, no syscalls in the data path) delivers exactly the
+tight, predictable timing that's the whole point of using it. But there
+is a real long tail: p99.9 jumps to ~4x the median, and the rare max hit
+~15x. That's roughly 1-in-1000 requests seeing a multi-microsecond
+stall, and a rarer one-in-thousands event costing tens of microseconds.
+
+That tail isn't a DPDK limitation so much as an *un-isolated Linux*
+limitation — this test only applied two tuning steps (performance
+governor, NUMA pinning), not full real-time isolation. What's still
+sharing the polling core and could explain the outliers:
+- **No CPU isolation** (`isolcpus`/`nohz_full`) — the polling core is
+  still schedulable by the kernel for other tasks, and each preemption
+  costs however long that task runs.
+- **No IRQ affinity tuning** — hardware interrupts (other NICs, timers,
+  etc.) can still land on the polling core and steal cycles from it.
+- **No control over C-states/turbo transitions** beyond the governor —
+  a deep sleep-state wakeup or frequency transition takes real time.
+- **Not a `PREEMPT_RT` kernel** — even a fully isolated core on a stock
+  kernel has bounded-but-nonzero worst-case scheduling latency.
+
+None of that was set up here (out of scope for this repo), so this
+result should be read as "DPDK's data path is deterministic; this
+particular host's OS environment around it is only partially tuned for
+determinism" rather than a statement about DPDK's own ceiling — a fully
+isolated setup (isolcpus + IRQ affinity + PREEMPT_RT) would be expected
+to tighten the p99.9/max tail substantially.
+
 #### Architecture
 
 ```mermaid

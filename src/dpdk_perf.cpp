@@ -401,6 +401,20 @@ static void run_client_latency(const rte_ether_addr &own_mac,
     printf("RTT us: avg=%.3f min=%.3f max=%.3f stdev=%.3f "
            "jitter(rfc3550)=%.3f (n=%zu)\n",
            avg, mn, mx, stdev, rfc3550_jitter, rtts_us.size());
+
+    // Percentiles are what actually answer "is this deterministic":
+    // stdev/avg can look fine while a long tail of rare outliers still
+    // exists. Nearest-rank method (sort, index by ceil(p*n)-1).
+    std::vector<double> sorted = rtts_us;
+    std::sort(sorted.begin(), sorted.end());
+    auto pct = [&](double p) {
+        size_t idx = (size_t)std::ceil(p * sorted.size()) - 1;
+        idx = std::min(idx, sorted.size() - 1);
+        return sorted[idx];
+    };
+    printf("RTT us percentiles: p50=%.3f p90=%.3f p99=%.3f p99.9=%.3f "
+           "max=%.3f\n",
+           pct(0.50), pct(0.90), pct(0.99), pct(0.999), sorted.back());
 }
 
 int main(int argc, char **argv) {
