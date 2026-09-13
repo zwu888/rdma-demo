@@ -192,3 +192,28 @@ apples-to-apples comparison — two effects stack up:
 | `ib_write_lat` | 2B | 0.94 us |
 | `fi_pingpong` | 2B | 2.30 us |
 | `fi_pingpong` | 64KB | 12.3 us |
+
+### Tuning libfabric
+
+Every perftest/libfabric run logged `CPU Frequency is not max` — both
+hosts default to the `powersave` cpufreq governor, which lets cores clock
+down between the polling loop's completion checks. RDMA latency
+benchmarks are exactly the workload this hurts most.
+
+```bash
+sudo apt-get install -y numactl linux-cpupower
+sudo cpupower frequency-set -g performance
+```
+
+Then pin the process to the NIC's local NUMA node (`cat
+/sys/class/infiniband/<dev>/device/numa_node`; both hosts here are node 0)
+with `numactl --cpunodebind=0 --membind=0 fi_pingpong ...`.
+
+| | Default (powersave, no pinning) | Tuned (performance + NUMA pin) |
+|---|---|---|
+| Latency (2B) | 2.30 us | 1.44 us (~37% lower) |
+| Bandwidth (64KB) | 5340 MB/s (~42.7 Gb/s) | 5632 MB/s (~45.1 Gb/s) (~5% higher) |
+
+Note: `cpupower frequency-set` is not persistent across reboots on its
+own — set it via a systemd unit or `tuned` profile if you need it to
+survive a restart.
