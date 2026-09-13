@@ -47,6 +47,7 @@ struct Config {
     std::string server_ip;
     std::string local_ip; // server: local address to bind (optional)
     std::string domain;
+    std::string provider = "verbs";
     std::string port = "47592";
     size_t size = 65536;
     int window = 16;
@@ -96,6 +97,7 @@ static Config parse_args(int argc, char **argv) {
         };
         if (a == "-d") cfg.domain = next();
         else if (a == "-l") cfg.local_ip = next();
+        else if (a == "-P") cfg.provider = next();
         else if (a == "-p") cfg.port = next();
         else if (a == "-s") cfg.size = std::stoul(next());
         else if (a == "-w") cfg.window = std::stoi(next());
@@ -117,12 +119,16 @@ static Config parse_args(int argc, char **argv) {
 static fi_info *make_hints(const Config &cfg, bool constrain_ep_type = true) {
     fi_info *hints = fi_allocinfo();
     hints->caps = FI_MSG;
-    hints->mode = FI_CONTEXT | FI_RX_CQ_DATA;
     if (constrain_ep_type)
         hints->ep_attr->type = FI_EP_MSG;
-    hints->domain_attr->mr_mode =
-        FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
-    hints->fabric_attr->prov_name = strdup("verbs");
+    if (cfg.provider == "verbs") {
+        // The verbs provider requires these; other providers (e.g. tcp)
+        // don't support them at all, so only request them here.
+        hints->mode = FI_CONTEXT | FI_RX_CQ_DATA;
+        hints->domain_attr->mr_mode =
+            FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+    }
+    hints->fabric_attr->prov_name = strdup(cfg.provider.c_str());
     if (!cfg.domain.empty())
         hints->domain_attr->name = strdup(cfg.domain.c_str());
     return hints;
@@ -161,7 +167,7 @@ static void oob_server_send_addr(const Config &cfg, const void *addr, size_t add
     sockaddr_in sin{};
     sin.sin_family = AF_INET;
     sin.sin_addr.s_addr = INADDR_ANY;
-    sin.sin_port = htons((uint16_t)std::stoi(cfg.port));
+    sin.sin_port = htons((uint16_t)(std::stoi(cfg.port) + 1)); // oob control port, separate from the RDMA data port
     if (bind(lfd, (sockaddr *)&sin, sizeof(sin)) < 0) { perror("bind"); exit(1); }
     if (listen(lfd, 1) < 0) { perror("listen"); exit(1); }
     printf("control channel listening on port %s ...\n", cfg.port.c_str());
@@ -179,7 +185,7 @@ static std::vector<char> oob_client_recv_addr(const Config &cfg) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in sin{};
     sin.sin_family = AF_INET;
-    sin.sin_port = htons((uint16_t)std::stoi(cfg.port));
+    sin.sin_port = htons((uint16_t)(std::stoi(cfg.port) + 1)); // oob control port, separate from the RDMA data port
     if (inet_pton(AF_INET, cfg.server_ip.c_str(), &sin.sin_addr) != 1) {
         fprintf(stderr, "invalid server IP: %s\n", cfg.server_ip.c_str());
         exit(1);
@@ -270,11 +276,14 @@ static void run_server(const Config &cfg) {
     fi_info *hints = make_hints(cfg, /*constrain_ep_type=*/false);
     fi_info *info = nullptr;
     const char *local_node = cfg.local_ip.empty() ? NULL : cfg.local_ip.c_str();
-    // service left NULL: the RDMA identify doesn't need to match any
-    // particular port -- the client gets our real address out-of-band
-    // (see file header comment), not by dialing this port via rdma_cm.
-    CHECK("fi_getinfo",
-          fi_getinfo(FI_VERSION(1, 5), local_node, NULL, FI_SOURCE, hints, &info));
+    // For verbs, service is left NULL: the RDMA identify doesn't need to
+    // match any particular port -- the client gets our real address
+    // out-of-band (see file header comment), not by dialing this port
+    // via rdma_cm. Other providers (e.g. tcp) have no address fallback
+    // when both node and service are NULL, so they need a real service.
+    const char *local_service = (cfg.provider == "verbs") ? NULL : cfg.port.c_str();
+    CHECK("fi_getinfo", fi_getinfo(FI_VERSION(1, 5), local_node, local_service,
+                                    FI_SOURCE, hints, &info));
     fi_freeinfo(hints);
 
     Endpoint e;

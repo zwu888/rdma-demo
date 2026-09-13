@@ -217,6 +217,44 @@ new transport; it's a portable API sitting on top of the same verbs
 device, so its numbers reflect the underlying RoCE link plus libfabric's
 own protocol/framing overhead rather than a competing fabric.
 
+### TCP baseline, same tool and wire
+
+libfabric also has a plain `tcp` provider (normal kernel sockets, no
+RDMA). Running the exact same `fi_pingpong -e msg` benchmark against it
+over the identical NIC/cable — the only thing that changes is `-p tcp`
+instead of `-p verbs` — gives a clean apples-to-apples RDMA-vs-TCP
+comparison, since it's the same tool, same sizes, same physical link:
+
+```bash
+# server
+fi_pingpong -p tcp -e msg -S 65536 -I 1000
+
+# client
+fi_pingpong -p tcp -e msg -S 65536 -I 1000 192.168.100.2
+```
+
+| | TCP (`fi_pingpong -p tcp`) | RoCE (`fi_pingpong -p verbs`) | RoCE advantage |
+|---|---|---|---|
+| Bandwidth (64KB, round-trip) | 1266 MB/s (~10.1 Gb/s) | 5340 MB/s (~42.7 Gb/s) | ~4.2x |
+| Latency (2B, round-trip) | 12.54 us/xfer | 2.30 us/xfer | ~5.4x lower |
+
+Same message sizes, same unpipelined ping-pong pattern, same physical
+cable — the difference here is entirely the kernel TCP/IP stack (socket
+syscalls, kernel copies, interrupt-driven processing) versus RDMA's
+kernel-bypass, zero-copy data path. This is the number that actually
+justifies bothering with RDMA/RoCE in the first place, as opposed to the
+native-IB-vs-RoCE story above, which was purely about link setup, not a
+real performance difference.
+
+Note: our own `src/fi_bw.cpp` doesn't work with `-P tcp` yet — the tcp
+provider tries to bind the new per-connection endpoint (created from the
+`FI_CONNREQ` event's info) to the same address:port the passive endpoint
+is already listening on, which fails with `EADDRINUSE`. This doesn't
+happen with the `verbs` provider (each connection gets its own RDMA_CM
+identifier, no shared socket to collide on). `fi_pingpong` handles the
+tcp case correctly internally, so it was used for this comparison
+instead.
+
 ### Why the latency numbers differ so much (0.94us vs 12.3us)
 
 The `ib_write_lat`/`fi_pingpong` latency figures above aren't actually an
