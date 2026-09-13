@@ -475,3 +475,58 @@ benchmarks are exactly the workload this hurts most. Fix in two steps:
 Note: `cpupower frequency-set` is not persistent across reboots on its
 own — set it via a systemd unit or `tuned` profile if you need it to
 survive a restart.
+
+## DPDK compatibility
+
+DPDK isn't installed here, but it's worth documenting whether it *could*
+run alongside the RDMA setup above without disrupting it.
+
+**Why a basic setup is safe:** DPDK's `mlx5` PMD attaches to the
+ConnectX-4 through the same `mlx5_core`/`mlx5_ib` kernel driver and
+`libibverbs` stack the RDMA tools in this repo already use — it's a
+"bifurcated" model, not exclusive ownership. It opens its own QPs/CQs via
+verbs, the same way `fi_bw`, `ib_write_bw`, etc. do. Multiple independent
+verbs consumers can coexist on one port simultaneously (this repo's own
+tools have done exactly that all session — perftest, `fi_pingpong`, and
+`fi_bw` each opening/closing connections on `rocep21s0` back-to-back with
+no conflicts). A default-mode `dpdk-testpmd` run wouldn't touch the RDMA
+path or require any link reset.
+
+Missing prerequisites if you do want to try it: the `dpdk`/`dpdk-dev`
+packages (not installed), hugepages (`HugePages_Total: 0` currently —
+reserve some via `vm.nr_hugepages` before running any DPDK app). IOMMU
+is already active (165 IOMMU groups) and `hugetlbfs` is already mounted
+at `/dev/hugepages`.
+
+**What would actually break the RDMA flow:**
+
+1. **`dpdk-devbind.py` unbinding the NIC to `vfio-pci`/`igb_uio`.** This
+   is the standard DPDK setup step for most NICs, but it's the *wrong*
+   move for mlx5 — unbinding it from `mlx5_core` rips out the same PCI
+   function `ib_uverbs`/`rocep21s0` depend on, killing the RDMA device
+   entirely until rebound. mlx5 is specifically designed to skip this
+   step; a generic DPDK tutorial that says "bind all NICs to vfio-pci"
+   is a real footgun here.
+
+2. **Switching the NIC into switchdev/eswitch mode**
+   (`devlink dev eswitch set ... mode switchdev`) for SR-IOV
+   representor/hardware-offload use cases. That reconfigures the NIC's
+   port model and **does trigger a device reset** — the same kind of
+   link flap we saw from `mstfwreset` when switching `LINK_TYPE_P1`
+   earlier in this README. RDMA connections would drop during that
+   reset.
+
+3. **Reconfiguring queue/VF counts via `mstconfig`** (e.g. changing
+   `NUM_OF_VFS` for SR-IOV) — same story: a firmware-level change
+   requiring `mstfwreset`, causing a brief link interruption.
+
+4. **Bandwidth contention** isn't "breaking" per se, but worth noting:
+   DPDK traffic and RDMA traffic share the same physical 100Gb link and
+   PCIe lanes, so running both under heavy load at the same time means
+   they compete for wire bandwidth.
+
+Bottom line: a basic `dpdk-testpmd` run in default legacy mode, with no
+`devbind` and no eswitch mode change, is safe and coexists fine with the
+RDMA setup here. SR-IOV/switchdev-style DPDK testing is a separate, more
+invasive step that should be planned for a time when nothing else needs
+the RDMA link live.
