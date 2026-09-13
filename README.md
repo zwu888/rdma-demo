@@ -562,6 +562,83 @@ traffic as theorized above. Given isolation mode works and coexists
 cleanly, there was no reason to test the riskier non-isolated path
 against a live link.
 
+### DPDK's own throughput and latency
+
+Measured DPDK's raw forwarding performance directly, still with
+`--flow-isolate-all` and explicit narrow `rte_flow` rules (never a
+wildcard capture) — same safety posture as the coexistence test above.
+
+**Throughput** — `testpmd` in `txonly` mode (this host) generating UDP
+traffic to `testpmd` in `rxonly` mode (`hpz6g4`), 1470-byte frames, an
+explicit flow rule matching only UDP dst port 9999:
+
+```bash
+# receiver (hpz6g4)
+dpdk-testpmd -l 0-2 -n 4 -a 0000:2d:00.0 -- --forward-mode=rxonly \
+    --stats-period=2 --flow-isolate-all -i
+# at the testpmd> prompt:
+#   flow create 0 ingress pattern eth / ipv4 / udp dst is 9999 / end actions queue index 0 / end
+#   start
+
+# sender (this host)
+dpdk-testpmd -l 0-2 -n 4 -a 0000:15:00.0 -- --forward-mode=txonly \
+    --stats-period=2 --flow-isolate-all --eth-peer=0,<receiver-MAC> \
+    --tx-ip=192.168.100.1,192.168.100.2 --tx-udp=9999,9999 --txpkts=1470
+```
+
+- **~81.2–81.3 Gb/s sustained**, **~6.9 Mpps**
+- **~0.1% drop rate** on the receiver's own counter (57,494 of 57.16M
+  packets while both sides were concurrently running) — attributable to
+  the default 256-descriptor RX ring at near-line-rate load, not a real
+  problem; a larger `--rxd` or multiple RX queues would likely close it
+- For context: close to `ib_write_bw`'s 92.5 Gb/s, well above
+  `fi_pingpong`'s 42.7 Gb/s — raw DPDK forwarding of always-outstanding
+  frames is architecturally closer to `ib_write_bw`'s approach than to
+  `fi_pingpong`'s unpipelined ping-pong.
+
+Caveat from the first attempt at this: the two `testpmd` instances were
+started a few seconds apart with mismatched hold durations, so the
+receiver's listen window ended before the sender stopped transmitting —
+its cumulative packet counts (57M received vs. 221M sent) looked like a
+~74% loss rate but was purely a test-harness timing artifact, not real
+network loss. The reliable number is the 0.1% drop rate from the period
+both sides were verifiably running concurrently.
+
+**Latency** — `testpmd`'s `txonly`/`rxonly` modes don't produce
+per-packet latency; DPDK's `--latencystats` timestamp feature needs
+synchronized clocks between hosts (e.g. PTP) to give a meaningful
+one-way number, which isn't set up here. Instead, used the standard
+"ping a DPDK `icmpecho` responder" trick: `testpmd` in `icmpecho` mode
+on `hpz6g4`, isolated with an explicit ICMP-only flow rule, answering
+plain kernel `ping` from this host — a widely-used way to demonstrate
+DPDK's kernel-bypass reply path using an ordinary RTT tool instead of
+needing synchronized clocks:
+
+```bash
+# responder (hpz6g4)
+dpdk-testpmd -l 0-2 -n 4 -a 0000:2d:00.0 -- --forward-mode=icmpecho \
+    --flow-isolate-all -i
+# at the testpmd> prompt:
+#   flow create 0 ingress pattern eth / ipv4 / icmp / end actions queue index 0 / end
+#   start
+
+# this host
+ping -I enp21s0np0 -c 30 -i 0.2 192.168.100.2
+```
+
+| | RTT avg | RTT min |
+|---|---|---|
+| Kernel-to-kernel (no DPDK) | 0.202 ms | 0.165 ms |
+| DPDK `icmpecho` responder | 0.099 ms | 0.075 ms |
+
+**Roughly half the round-trip latency**, 0% packet loss (30/30 both
+ways) — the reply path skips the kernel network stack entirely, going
+straight from NIC RX to a userspace ICMP reply and back out TX.
+
+Both tests: RoCE link state stayed `ACTIVE` throughout and after on both
+hosts, and a `fi_bw` bandwidth check immediately after each test matched
+the established baseline (~83 Gb/s) — no regression from any of this.
+
 **What would actually break the RDMA flow:**
 
 1. **`dpdk-devbind.py` unbinding the NIC to `vfio-pci`/`igb_uio`.** This
