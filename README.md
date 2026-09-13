@@ -990,6 +990,64 @@ app-level retry logic needed) — and that same reliability layer is
 where its rare, larger tail-latency events come from, which DPDK's raw
 unreliable transport simply doesn't have.
 
+#### Full userspace TCP/IP stacks: F-Stack and lwIP (researched, not built)
+
+Everything above is raw packet forwarding (DPDK `ethdev`) or a
+connection-oriented RDMA transport — neither gives you POSIX sockets. If
+a control application actually needs a real TCP/IP stack (`accept`,
+`connect`, `read`, `write`) at DPDK-class speed rather than raw frames,
+the two candidates are F-Stack and lwIP-on-DPDK. Researched both;
+neither was built or tested here, for reasons that turned out to matter
+more than expected.
+
+**F-Stack** ports FreeBSD's userspace TCP/IP stack onto DPDK — full
+POSIX sockets, production-proven (originated at Tencent, still actively
+released). Three real obstacles to actually running it against this
+repo's setup:
+1. **DPDK version pinning** — recent releases build against DPDK
+   23.11.5 specifically, via its own bundled meson/ninja build, not the
+   system's apt-installed DPDK 24.11.4 already set up here.
+2. **mlx5 is supported, with real config work** — F-Stack's own
+   troubleshooting wiki documents ConnectX/mlx5 support via
+   `rdma-core`/`libibverbs-dev`/`libmlx5` (already installed) plus
+   enabling `CONFIG_RTE_LIBRTE_MLX5_PMD` in the DPDK build, so it can
+   use the same bifurcated model (no `vfio-pci` unbinding) the rest of
+   this repo's DPDK work relied on.
+3. **The blocker: F-Stack wants to own the entire port's IP traffic.**
+   Every DPDK test elsewhere in this repo was deliberately scoped with
+   `rte_flow_isolate` + one narrow explicit rule, specifically so it
+   never touched the kernel-IP-based RDMA/RoCE setup on
+   `rocep21s0`/`enp21s0np0`. F-Stack is architecturally the opposite —
+   it *is* a TCP/IP stack, so it needs broad traffic capture on
+   whatever port it runs against. Pointing it at the ConnectX-4 used
+   for the whole RDMA demo would very plausibly break the
+   `192.168.100.x` kernel IP config the RDMA/OOB-control-channel setup
+   depends on.
+
+**lwIP-on-DPDK** is a much weaker candidate. The integrations that
+exist (e.g. `tinyhttpd-lwip-dpdk`) are academic/demo-grade — ~21
+commits, ~46 stars, pinned to DPDK 22.03 (2022), explicitly built as "a
+quick benchmark" rather than production infrastructure — with no
+mlx5/bifurcated-driver support documented anywhere; every example only
+covers Intel NICs via `vfio-pci` exclusive binding, the exact pattern
+flagged as the wrong move for mlx5 earlier in this README. More
+fundamentally, lwIP's actual sweet spot is a different problem than
+this repo's: it was designed for resource-constrained embedded/RTOS
+environments (microcontrollers, small footprint) — genuinely relevant
+to real hard-real-time control *hardware* (a motor controller's MCU),
+but that's bare-metal-on-a-microcontroller territory, not "bolted onto
+DPDK on a 100Gb NIC in a Xeon server." It's more accurate to think of
+lwIP as what you'd run on the embedded end of a control system than as
+a stack to benchmark against DPDK raw sockets on hardware like this.
+
+**Net takeaway:** if a POSIX-sockets userspace stack is actually needed
+for a control application on this class of hardware, F-Stack is the far
+better candidate — mature, mlx5-documented, production-proven — but
+using it here would require a separate DPDK 23.11.5 build and a NIC
+port dedicated entirely to it, not shared with the RDMA demo. Neither
+constraint is prohibitive, just out of scope for what this repo has
+tested so far.
+
 #### Architecture
 
 ```mermaid
