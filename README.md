@@ -723,6 +723,49 @@ extensive isolation testing proved the round trip mechanism itself
 works (see "Debugging trail" in the TODO entry). Use the `testpmd
 icmpecho` approach above for a working DPDK latency number instead.
 
+#### Architecture
+
+```mermaid
+sequenceDiagram
+    participant S as Server (hpz6g4)
+    participant C as Client (hpz8g4)
+
+    Note over S,C: Setup (both sides, setup_port())
+    S->>S: rte_flow_isolate() -- before configure/start
+    S->>S: rte_eth_dev_configure + rx/tx_queue_setup
+    S->>S: rte_eth_dev_start()
+    S->>S: rte_flow_create(): UDP dst port 5201 -> queue 0
+    C->>C: (identical setup on its own port)
+
+    rect rgb(210, 240, 210)
+    Note over S,C: Throughput mode -- validated, 83.51 Gb/s
+    loop bursts of up to 32 frames
+        C->>C: make_packet() x N (eth+ipv4+udp+payload)
+        C->>S: rte_eth_tx_burst()
+        S->>S: rte_eth_rx_burst() -- count frames + bytes
+    end
+    Note over S: 500000/500000 received, byte count exact
+    end
+
+    rect rgb(245, 210, 210)
+    Note over S,C: Latency mode -- broken, root cause unknown
+    C->>C: make_packet(), record send_ns
+    C->>S: rte_eth_tx_burst() [1 frame]
+    S->>S: rte_eth_rx_burst() -- frame received (confirmed in logs)
+    S->>S: build fresh reply mbuf (swap src/dst MAC + IP)
+    S--xC: rte_eth_tx_burst() reports success, but frame never arrives
+    C->>C: rte_eth_rx_burst() spins, hits 1s bound, times out
+    Note over C: rte_eth_stats_get(): ipackets=0, imissed=0 -- not even "dropped"
+    end
+```
+
+Note the asymmetry the diagram is built around: the same `setup_port()`
+code runs on both sides, and `testpmd`'s `mac`-forward mode proved this
+exact reply mechanism *can* work on this hardware (a separate test, not
+`dpdk_perf` itself) — so the failure is specific to something in this
+program's client-side receive path that six rounds of isolation testing
+didn't identify. See the TODO entry for the full debugging trail.
+
 **What would actually break the RDMA flow:**
 
 1. **`dpdk-devbind.py` unbinding the NIC to `vfio-pci`/`igb_uio`.** This
